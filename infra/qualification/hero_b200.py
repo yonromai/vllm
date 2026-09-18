@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -12,6 +13,8 @@ import multiprocessing as mp
 import os
 import re
 import socket
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -29,7 +32,7 @@ GOLDEN_ROOT = (
 )
 WEIGHT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "hero-535b-step108000-bf16-split-v2"
+    "hero-535b-step108000-bf16-split-v3"
 )
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
@@ -41,6 +44,27 @@ WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
 MASTER_PORT = 29555
 TOP_LOGPROBS = 64
+QUALIFICATION_GPUS_PER_TASK = 4
+QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
+PRECOMPILED_WHEEL = (
+    "https://github.com/marin-community/vllm/releases/download/"
+    "marin-vllm-gpu-candidate-70ea9ae8f260/"
+    "vllm-0.0.0.dev20260916%2Bmarin.70ea9ae8f260.cu132-"
+    "cp38-abi3-manylinux_2_28_aarch64.whl"
+)
+QUALIFICATION_SETUP = f"""\
+set -e
+cd "$IRIS_WORKDIR"
+uv venv --python 3.12 "$IRIS_VENV"
+SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0+marin.{VLLM_REVISION[:12]} \\
+VLLM_USE_PRECOMPILED=1 \\
+VLLM_PRECOMPILED_WHEEL_LOCATION='{PRECOMPILED_WHEEL}' \\
+uv pip install \\
+  --python "$IRIS_VENV/bin/python" \\
+  --constraint infra/release/gpu-constraints.txt \\
+  --index-strategy unsafe-best-match \\
+  --editable '.[runai]'
+"""
 
 # Fixed before the acceptance run. The comparison report applies these bounds.
 TARGET_LOGPROB_TOLERANCE = 0.10
@@ -353,6 +377,7 @@ def _run_rank(
         "golden_root": GOLDEN_ROOT,
         "weight_root": WEIGHT_ROOT,
         "vllm_revision": VLLM_REVISION,
+        "qualification_revision": os.environ["HERO_QUALIFICATION_REVISION"],
         "iris_task_id": os.environ.get("IRIS_TASK_ID"),
         "host": socket.gethostname(),
         "local_rank": local_rank,
@@ -495,5 +520,88 @@ def main() -> None:
         raise RuntimeError(f"Qualification ranks failed: {failures}")
 
 
+def submit(iris_config: Path) -> None:
+    """Submit the fixed two-node B200 qualification job through Iris."""
+    from fray.iris_backend import (
+        convert_constraints,
+        convert_resources,
+        resolve_coscheduling,
+    )
+    from fray.types import GpuConfig, ResourceConfig
+    from iris.cli.connect import connect_controller
+    from iris.client.client import IrisClient
+    from iris.cluster.types import Entrypoint, EnvironmentSpec
+    from iris.rpc import job_pb2
+    from iris.rpc.proto_display import priority_band_value
+    from rigging.timing import Duration
+
+    repository = Path(__file__).resolve().parents[2]
+    subprocess.run(
+        ["git", "diff", "--exit-code", "HEAD", "--"], cwd=repository, check=True
+    )
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repository, text=True
+    ).strip()
+    name_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "qualification_revision": revision,
+                "result_root": RESULT_ROOT,
+                "weight_root": WEIGHT_ROOT,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()[:12]
+    resources = ResourceConfig(
+        cpu=64,
+        ram="400g",
+        disk="1t",
+        device=GpuConfig(variant="GB200", count=QUALIFICATION_GPUS_PER_TASK),
+        replicas=QUALIFICATION_TASKS,
+    )
+    native_resources = convert_resources(resources)
+    with (
+        connect_controller(config_file=iris_config) as endpoint,
+        IrisClient.remote(
+            endpoint.url,
+            credentials=endpoint.credentials,
+            workspace=repository,
+        ) as client,
+    ):
+        job = client.submit(
+            entrypoint=Entrypoint.from_command(
+                "python", "infra/qualification/hero_b200.py"
+            ),
+            name=f"hero-vllm-qualification-{name_digest}",
+            user="hero-vllm",
+            resources=native_resources,
+            replicas=QUALIFICATION_TASKS,
+            environment=EnvironmentSpec(
+                env_vars={
+                    "HERO_QUALIFICATION_REVISION": revision,
+                    "PYTHONUNBUFFERED": "1",
+                },
+                setup_scripts=[QUALIFICATION_SETUP],
+            ),
+            constraints=convert_constraints(resources),
+            coscheduling=resolve_coscheduling(resources, QUALIFICATION_TASKS),
+            scheduling_timeout=Duration.from_hours(24),
+            timeout=Duration.from_hours(8),
+            max_retries_failure=0,
+            max_retries_preemption=0,
+            max_task_failures=0,
+            priority_band=priority_band_value("interactive"),
+            existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
+        )
+    print(job.job_id)
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "submit":
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("submit")
+        parser.add_argument("--iris-config", type=Path, required=True)
+        args = parser.parse_args()
+        submit(args.iris_config)
+    else:
+        main()

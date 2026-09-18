@@ -175,6 +175,7 @@ def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]
         "golden_root",
         "weight_root",
         "vllm_revision",
+        "qualification_revision",
         "runtime",
         "input_evidence",
         "serving_config",
