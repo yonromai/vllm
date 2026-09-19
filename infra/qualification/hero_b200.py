@@ -41,12 +41,12 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v32-full-logits-audit",
+    "qualification-9d1ccba766-v33-full-logits-audit",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
-MASTER_PORT = 29555
+MASTER_PORT = 43691
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4

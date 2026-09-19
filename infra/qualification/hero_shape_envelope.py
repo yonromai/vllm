@@ -104,9 +104,7 @@ def _span(reference: tuple[float, ...]) -> float:
     return max(reference) - min(reference)
 
 
-def _mode_metrics(
-    native: NativeEnvelope, case: int, mode: dict
-) -> tuple[float, float]:
+def _mode_metrics(native: NativeEnvelope, case: int, mode: dict) -> tuple[float, float]:
     max_target = 0.0
     max_top_probability = 0.0
     for row in mode["positions"]:
@@ -192,9 +190,7 @@ def evaluate(native: NativeEnvelope, report: dict, ranks: list[dict]) -> dict:
         ):
             target, top_probability = _mode_metrics(native, case, rank[source_name])
             adjusted[f"case-{case}/{mode_name}/target-logprob"] = target
-            adjusted[f"case-{case}/{mode_name}/saved-top-probability"] = (
-                top_probability
-            )
+            adjusted[f"case-{case}/{mode_name}/saved-top-probability"] = top_probability
         for pair_name, left, right in (
             ("prefill-vs-cached-decode", "prefill", "cached_decode"),
             ("short-vs-repeat-prefill", "short", "prefill"),
@@ -203,9 +199,7 @@ def evaluate(native: NativeEnvelope, report: dict, ranks: list[dict]) -> dict:
                 native, case, rank[left], rank[right]
             )
             adjusted[f"case-{case}/{pair_name}/target-logprob"] = target
-            adjusted[f"case-{case}/{pair_name}/saved-top-probability"] = (
-                top_probability
-            )
+            adjusted[f"case-{case}/{pair_name}/saved-top-probability"] = top_probability
     gates = []
     for gate in report["gates"]:
         changed = gate["name"] in adjusted
@@ -243,8 +237,7 @@ def main() -> None:
         native = NativeEnvelope({key: arrays[key] for key in arrays.files})
     report = json.loads(args.report.read_text())
     ranks = [
-        json.loads((args.ranks / f"rank-{rank}.json").read_text())
-        for rank in range(8)
+        json.loads((args.ranks / f"rank-{rank}.json").read_text()) for rank in range(8)
     ]
     print(json.dumps(evaluate(native, report, ranks), indent=2, sort_keys=True))
 
