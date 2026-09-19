@@ -40,7 +40,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v3",
+    "qualification-9d1ccba766-v4",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -288,6 +288,12 @@ def _run_rank(
     output_path: str,
     input_evidence: dict[str, Any],
 ) -> None:
+    # Iris tears down failed pods promptly; keep engine subprocess output in
+    # the same S3 run so the original startup error survives the teardown.
+    log_path = Path(output_path).with_suffix(".log")
+    with log_path.open("w", buffering=1) as log_file:
+        os.dup2(log_file.fileno(), sys.stdout.fileno())
+        os.dup2(log_file.fileno(), sys.stderr.fileno())
     os.environ.update(
         {
             "VLLM_DP_RANK": str(global_rank),
@@ -542,6 +548,12 @@ def main() -> None:
         process.join()
         if process.exitcode != 0:
             failures.append((global_rank, process.exitcode))
+            log_path = output_path.with_suffix(".log")
+            if log_path.exists():
+                log_uri = f"{RESULT_ROOT}/rank-{global_rank}.log"
+                bucket, key = _s3_parts(log_uri)
+                client.upload_file(str(log_path), bucket, key)
+                print(f"uploaded failure log {log_uri}", flush=True)
             continue
         result_uri = f"{RESULT_ROOT}/rank-{global_rank}.json"
         _put_json(client, result_uri, json.loads(output_path.read_text()))
