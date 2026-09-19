@@ -1476,8 +1476,11 @@ class GrugMoeForCausalLM(
                     logits=logits.detach().float().cpu().numpy(),
                 )
         decode_dir = os.environ.get("HERO_DECODE_LOGITS_DIR")
+        decode_arm = os.environ.get("HERO_DECODE_CAPTURE_ARM_PATH")
         if (
             decode_dir is not None
+            and decode_arm is not None
+            and Path(decode_arm).exists()
             and isinstance(hidden_states, torch.Tensor)
             and positions.numel() <= 2
         ):

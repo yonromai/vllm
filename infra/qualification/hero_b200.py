@@ -374,6 +374,9 @@ def _run_rank(
     os.environ["HERO_DECODE_LOGITS_DIR"] = str(
         Path(output_path).with_suffix(".decode-logits")
     )
+    decode_capture_arm = Path(output_path).with_suffix(".decode-capture-armed")
+    os.environ["HERO_DECODE_CAPTURE_ARM_PATH"] = str(decode_capture_arm)
+    decode_capture_arm.unlink(missing_ok=True)
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
 
     llm = LLM(
@@ -450,6 +453,9 @@ def _run_rank(
     # intermediate tokens.
     # Queue both windows together: offline DP/EP must keep every rank in the
     # same engine wave until all ranks have completed their collective steps.
+    # The engine process is already running, so arm through a file it can see.
+    # In particular, its startup probes can use position zero before this run.
+    decode_capture_arm.touch()
     decode_outputs = llm.generate(
         [{"prompt_token_ids": tokens[:start]} for start, _ in windows],
         [
