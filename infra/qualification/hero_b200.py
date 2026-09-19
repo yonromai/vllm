@@ -41,7 +41,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v8",
+    "qualification-9d1ccba766-v9",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -361,7 +361,7 @@ def _run_rank(
         tensor_parallel_size=1,
         enable_expert_parallel=True,
         all2all_backend="allgather_reducescatter",
-        attention_config={"backend": "FLASH_ATTN"},
+        attention_config={"backend": "TRITON_ATTN"},
         enforce_eager=True,
         enable_prefix_caching=False,
         enable_trace_replay=True,
@@ -423,8 +423,24 @@ def _run_rank(
     windows = [(max(1, valid_length - 32), valid_length)]
     if valid_length >= 4095:
         windows.append((2040, 2052))
+    # Queue both windows together: offline DP/EP must keep every rank in the
+    # same engine wave until all ranks have completed their collective steps.
+    decode_outputs = llm.generate(
+        [{"prompt_token_ids": tokens[:start]} for start, _ in windows],
+        [
+            SamplingParams(
+                trace_decode_token_ids=tokens[start:end],
+                max_tokens=end - start,
+                logprobs=TOP_LOGPROBS,
+                temperature=0,
+                detokenize=False,
+            )
+            for start, end in windows
+        ],
+        use_tqdm=False,
+    )
     decoded_positions: list[dict[str, Any]] = []
-    for prompt_length, end in windows:
+    for (prompt_length, end), output in zip(windows, decode_outputs, strict=True):
         continuation = tokens[prompt_length:end]
         indices = prediction_indices[
             (arrays["prediction_positions"][prediction_indices] >= prompt_length - 1)
@@ -435,17 +451,7 @@ def _run_rank(
                 f"Cached decode case {global_rank} window {prompt_length}:{end} "
                 "has no saved positions"
             )
-        decode_output = llm.generate(
-            [{"prompt_token_ids": tokens[:prompt_length]}],
-            SamplingParams(
-                trace_decode_token_ids=continuation,
-                max_tokens=len(continuation),
-                logprobs=TOP_LOGPROBS,
-                temperature=0,
-                detokenize=False,
-            ),
-            use_tqdm=False,
-        )[0].outputs[0]
+        decode_output = output.outputs[0]
         if list(decode_output.token_ids) != continuation:
             raise ValueError(
                 f"Trace replay diverged for case {global_rank} "
@@ -504,7 +510,7 @@ def _run_rank(
             "moe_capacity_dropping": False,
             "pipeline_parallel_size": 1,
             "all2all_backend": "allgather_reducescatter",
-            "attention_backend": "FLASH_ATTN",
+            "attention_backend": "TRITON_ATTN",
             "enforce_eager": True,
             "enable_prefix_caching": False,
             "model_runner": "v2",
