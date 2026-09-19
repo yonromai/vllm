@@ -194,6 +194,70 @@ def audit(
     }
 
 
+def audit_decode(
+    native_arrays: dict[str, np.ndarray],
+    captured_ranks: list[dict],
+    captured_logits: list[dict[str, np.ndarray]],
+    decode_logits: list[dict[str, np.ndarray] | None],
+) -> list[dict]:
+    results = []
+    for case, captured in enumerate(decode_logits):
+        if captured is None:
+            continue
+        cached_rows = {
+            int(row["prediction_position"]): row
+            for row in captured_ranks[case]["cached_decode"]["positions"]
+        }
+        prefill_rows = {
+            int(position): logits
+            for position, logits in zip(
+                captured_logits[case]["positions"],
+                captured_logits[case]["logits"],
+                strict=True,
+            )
+        }
+        for position, forward_rows, logits in zip(
+            captured["positions"],
+            captured["forward_rows"],
+            captured["logits"],
+            strict=True,
+        ):
+            position = int(position)
+            row = cached_rows[position]
+            target = int(row["target_token_id"])
+            probabilities = _probabilities(logits)
+            native_matches = _matching_native_logits(native_arrays, case, position)
+            results.append(
+                {
+                    "case": case,
+                    "position": position,
+                    "forward_rows": int(forward_rows),
+                    "api_target_logprob_difference": float(
+                        np.log(probabilities[target])
+                        - float(row["target_logprob_observed"])
+                    ),
+                    "prefill_vs_decode": _distribution_metrics(
+                        prefill_rows[position], logits
+                    ),
+                    "closest_native": min(
+                        (
+                            {
+                                "native_case": int(
+                                    native_arrays["full_logit_case_indices"][index]
+                                ),
+                                **_distribution_metrics(
+                                    native_arrays["full_logits"][index], logits
+                                ),
+                            }
+                            for index in native_matches
+                        ),
+                        key=lambda value: value["total_variation"],
+                    ),
+                }
+            )
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-arrays", type=Path, required=True)
@@ -217,6 +281,16 @@ def main() -> None:
         with np.load(args.captured_ranks / f"rank-{rank}.full-logits.npz") as source:
             logits.append({name: source[name] for name in source.files})
     result = audit(native, original, captured, logits)
+    decode = []
+    for rank in range(8):
+        path = args.captured_ranks / f"rank-{rank}.decode-logits.npz"
+        if path.exists():
+            with np.load(path) as source:
+                decode.append({name: source[name] for name in source.files})
+        else:
+            decode.append(None)
+    if any(row is not None for row in decode):
+        result["decode_positions"] = audit_decode(native, captured, logits, decode)
     if args.original_native_arrays is not None:
         with np.load(args.original_native_arrays) as source:
             original_native = {name: source[name] for name in source.files}
