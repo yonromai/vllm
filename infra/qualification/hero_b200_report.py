@@ -204,10 +204,10 @@ def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]
             )
         }
         prefill_decode = _paired_summary(
-            result["prefill"],
             result["cached_decode"],
-            left_name="prefill",
-            right_name="cached-decode",
+            result["prefill"],
+            left_name="cached-decode",
+            right_name="prefill",
         )
         repeat_prefill = _paired_summary(
             result["short"],
@@ -309,7 +309,8 @@ def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]
         "repeat_state_evidence": {
             "note": (
                 "Each rank ran short prefill, full prefill, then cached trace "
-                "decode in one engine with prefix caching disabled."
+                "decode over recorded tail positions (and the 2,048 boundary "
+                "for 4K cases) in one engine with prefix caching disabled."
             )
         },
         "cases": cases,

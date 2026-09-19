@@ -41,7 +41,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v7",
+    "qualification-9d1ccba766-v8",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -275,6 +275,14 @@ def _measure_mode(
             }
         )
 
+    return _summarize_mode(mode, rank, positions)
+
+
+def _summarize_mode(
+    mode: str, rank: int, positions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if not positions:
+        raise ValueError(f"{mode} case {rank} has no saved positions")
     worst_target = max(positions, key=lambda row: row["target_logprob_abs_error"])
     worst_top = max(
         positions,
@@ -408,27 +416,62 @@ def _run_rank(
         prediction_indices=prediction_indices,
     )
 
-    decode_output = llm.generate(
-        [{"prompt_token_ids": tokens[:1]}],
-        SamplingParams(
-            trace_decode_token_ids=tokens[1:],
-            max_tokens=len(tokens) - 1,
-            logprobs=TOP_LOGPROBS,
-            temperature=0,
-            detokenize=False,
-        ),
-        use_tqdm=False,
-    )[0].outputs[0]
-    if list(decode_output.token_ids) != tokens[1:]:
-        raise ValueError(f"Trace replay diverged for case {global_rank}")
-    decode = _measure_mode(
-        mode="cached-decode",
-        request_logprobs=decode_output.logprobs,
-        array_index_for_prediction=lambda position: position,
-        arrays=arrays,
-        rank=global_rank,
-        prediction_indices=prediction_indices,
-    )
+    # Only the saved positions require oracle comparisons. The tail window
+    # covers every case; the long cases also score a short decode crossing the
+    # 2,048-token attention boundary without replaying thousands of unscored
+    # intermediate tokens.
+    windows = [(max(1, valid_length - 32), valid_length)]
+    if valid_length >= 4095:
+        windows.append((2040, 2052))
+    decoded_positions: list[dict[str, Any]] = []
+    for prompt_length, end in windows:
+        continuation = tokens[prompt_length:end]
+        indices = prediction_indices[
+            (arrays["prediction_positions"][prediction_indices] >= prompt_length - 1)
+            & (arrays["prediction_positions"][prediction_indices] < end - 1)
+        ]
+        if not len(indices):
+            raise ValueError(
+                f"Cached decode case {global_rank} window {prompt_length}:{end} "
+                "has no saved positions"
+            )
+        decode_output = llm.generate(
+            [{"prompt_token_ids": tokens[:prompt_length]}],
+            SamplingParams(
+                trace_decode_token_ids=continuation,
+                max_tokens=len(continuation),
+                logprobs=TOP_LOGPROBS,
+                temperature=0,
+                detokenize=False,
+            ),
+            use_tqdm=False,
+        )[0].outputs[0]
+        if list(decode_output.token_ids) != continuation:
+            raise ValueError(
+                f"Trace replay diverged for case {global_rank} "
+                f"window {prompt_length}:{end}"
+            )
+        segment = _measure_mode(
+            mode="cached-decode",
+            request_logprobs=decode_output.logprobs,
+            array_index_for_prediction=lambda position, start=prompt_length: (
+                position - start + 1
+            ),
+            arrays=arrays,
+            rank=global_rank,
+            prediction_indices=indices,
+        )
+        decoded_positions.extend(segment["positions"])
+    decoded_positions.sort(key=lambda row: row["prediction_position"])
+    if len({row["prediction_position"] for row in decoded_positions}) != len(
+        decoded_positions
+    ):
+        raise ValueError(f"Repeated cached-decode prediction for case {global_rank}")
+    decode = _summarize_mode("cached-decode", global_rank, decoded_positions)
+    decode["windows"] = [
+        {"prompt_length": prompt_length, "continuation_length": end - prompt_length}
+        for prompt_length, end in windows
+    ]
 
     result = {
         "case_index": global_rank,
@@ -466,6 +509,10 @@ def _run_rank(
             "enable_prefix_caching": False,
             "model_runner": "v2",
             "trace_replay": True,
+            "cached_decode_coverage": (
+                "last 31-32 tokens of each case; plus positions around the "
+                "2048-token boundary in the 4095- and 4096-token cases"
+            ),
             "max_model_len": 4097,
             "max_model_len_note": (
                 "4097 only lets the generate API return prompt logprobs for a "
