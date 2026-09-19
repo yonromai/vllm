@@ -566,6 +566,7 @@ def submit(iris_config: Path) -> None:
             endpoint.url,
             credentials=endpoint.credentials,
             workspace=repository,
+            bundle_exclude=re.compile(r"^(?:docs|tests)/"),
         ) as client,
     ):
         job = client.submit(
