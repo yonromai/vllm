@@ -41,7 +41,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v9",
+    "qualification-9d1ccba766-v10",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -361,7 +361,7 @@ def _run_rank(
         tensor_parallel_size=1,
         enable_expert_parallel=True,
         all2all_backend="allgather_reducescatter",
-        attention_config={"backend": "TRITON_ATTN"},
+        attention_config={"backend": "FLASH_ATTN", "flash_attn_version": 2},
         enforce_eager=True,
         enable_prefix_caching=False,
         enable_trace_replay=True,
@@ -510,7 +510,8 @@ def _run_rank(
             "moe_capacity_dropping": False,
             "pipeline_parallel_size": 1,
             "all2all_backend": "allgather_reducescatter",
-            "attention_backend": "TRITON_ATTN",
+            "attention_backend": "FLASH_ATTN",
+            "flash_attn_version": 2,
             "enforce_eager": True,
             "enable_prefix_caching": False,
             "model_runner": "v2",
