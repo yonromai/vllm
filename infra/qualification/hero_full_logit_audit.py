@@ -50,6 +50,51 @@ def _matching_native_logits(
     ]
 
 
+def native_bundle_parity(
+    original: dict[str, np.ndarray], diagnostic: dict[str, np.ndarray]
+) -> dict:
+    selected_fields = original.keys() - {
+        "full_logit_case_indices",
+        "full_logit_prediction_positions",
+        "full_logits",
+    }
+    fields = {
+        name: bool(np.array_equal(original[name], diagnostic[name]))
+        for name in sorted(selected_fields)
+    }
+    lookup = {
+        (int(case), int(position)): index
+        for index, (case, position) in enumerate(
+            zip(
+                diagnostic["full_logit_case_indices"],
+                diagnostic["full_logit_prediction_positions"],
+                strict=True,
+            )
+        )
+    }
+    original_full_rows = {}
+    for index, (case, position) in enumerate(
+        zip(
+            original["full_logit_case_indices"],
+            original["full_logit_prediction_positions"],
+            strict=True,
+        )
+    ):
+        key = (int(case), int(position))
+        other = lookup.get(key)
+        original_full_rows[f"{key[0]}/{key[1]}"] = other is not None and bool(
+            np.array_equal(
+                original["full_logits"][index], diagnostic["full_logits"][other]
+            )
+        )
+    return {
+        "fields": fields,
+        "original_full_rows": original_full_rows,
+        "all_original_fields_identical": all(fields.values()),
+        "all_original_full_rows_identical": all(original_full_rows.values()),
+    }
+
+
 def audit(
     native_arrays: dict[str, np.ndarray],
     original_ranks: list[dict],
@@ -152,6 +197,7 @@ def audit(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-arrays", type=Path, required=True)
+    parser.add_argument("--original-native-arrays", type=Path)
     parser.add_argument("--original-ranks", type=Path, required=True)
     parser.add_argument("--captured-ranks", type=Path, required=True)
     parser.add_argument("--output", type=Path)
@@ -170,11 +216,16 @@ def main() -> None:
     for rank in range(8):
         with np.load(args.captured_ranks / f"rank-{rank}.full-logits.npz") as source:
             logits.append({name: source[name] for name in source.files})
-    result = json.dumps(audit(native, original, captured, logits), indent=2) + "\n"
+    result = audit(native, original, captured, logits)
+    if args.original_native_arrays is not None:
+        with np.load(args.original_native_arrays) as source:
+            original_native = {name: source[name] for name in source.files}
+        result["native_bundle_parity"] = native_bundle_parity(original_native, native)
+    serialized = json.dumps(result, indent=2) + "\n"
     if args.output is None:
-        print(result, end="")
+        print(serialized, end="")
     else:
-        args.output.write_text(result)
+        args.output.write_text(serialized)
 
 
 if __name__ == "__main__":

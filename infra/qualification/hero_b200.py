@@ -41,12 +41,12 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v34-all-scored-logits",
+    "qualification-9d1ccba766-v35-cached-full-logits",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
-MASTER_PORT = 43731
+MASTER_PORT = 43771
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
@@ -350,6 +350,11 @@ def _run_rank(
     os.environ["HERO_FULL_LOGITS_PATH"] = str(
         Path(output_path).with_suffix(".full-logits.npz")
     )
+    decode_positions = {4: [2044], 6: [2048], 7: [2047, 2048]}.get(global_rank, [])
+    os.environ["HERO_DECODE_LOGITS_POSITIONS"] = json.dumps(decode_positions)
+    os.environ["HERO_DECODE_LOGITS_DIR"] = str(
+        Path(output_path).with_suffix(".decode-logits")
+    )
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
 
     llm = LLM(
@@ -485,6 +490,21 @@ def _run_rank(
         {"prompt_length": prompt_length, "continuation_length": end - prompt_length}
         for prompt_length, end in windows
     ]
+    if decode_positions:
+        capture_dir = Path(output_path).with_suffix(".decode-logits")
+        captures = sorted(capture_dir.glob("*.npz")) if capture_dir.exists() else []
+        if not captures:
+            raise RuntimeError(f"No cached full logits captured for rank {global_rank}")
+        captured = []
+        for capture in captures:
+            with np.load(capture) as source:
+                captured.append({name: source[name] for name in source.files})
+        np.savez_compressed(
+            Path(output_path).with_suffix(".decode-logits.npz"),
+            positions=np.concatenate([row["positions"] for row in captured]),
+            forward_rows=np.concatenate([row["forward_rows"] for row in captured]),
+            logits=np.concatenate([row["logits"] for row in captured]),
+        )
 
     result = {
         "case_index": global_rank,
@@ -675,6 +695,12 @@ def main() -> None:
         bucket, key = _s3_parts(logits_uri)
         client.upload_file(str(logits_path), bucket, key)
         print(f"uploaded {logits_uri}", flush=True)
+        decode_path = output_path.with_suffix(".decode-logits.npz")
+        if decode_path.exists():
+            decode_uri = f"{RESULT_ROOT}/rank-{global_rank}.decode-logits.npz"
+            bucket, key = _s3_parts(decode_uri)
+            client.upload_file(str(decode_path), bucket, key)
+            print(f"uploaded {decode_uri}", flush=True)
 
 
 def submit(iris_config: Path) -> None:

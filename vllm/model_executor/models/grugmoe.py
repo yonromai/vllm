@@ -1430,6 +1430,7 @@ class GrugMoeForCausalLM(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._hero_decode_capture_count = 0
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1470,6 +1471,41 @@ class GrugMoeForCausalLM(
                         positions=np.asarray(wanted, dtype=np.int32),
                         logits=logits.detach().float().cpu().numpy(),
                     )
+        decode_dir = os.environ.get("HERO_DECODE_LOGITS_DIR")
+        if (
+            decode_dir is not None
+            and isinstance(hidden_states, torch.Tensor)
+            and positions.numel() <= 2
+        ):
+            wanted = json.loads(os.environ["HERO_DECODE_LOGITS_POSITIONS"])
+            matches = [
+                (position, torch.nonzero(positions == position).flatten())
+                for position in wanted
+            ]
+            selected = [
+                (position, index) for position, index in matches if index.numel() == 1
+            ]
+            if selected:
+                if hidden_states.shape[0] != positions.shape[0]:
+                    raise ValueError("Hero decode logit rows do not match positions")
+                logits = self.compute_logits(
+                    hidden_states[torch.cat([index for _, index in selected])]
+                )
+                if logits is None:
+                    raise ValueError("Hero decode logit capture returned no logits")
+                path = Path(decode_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    path / f"{self._hero_decode_capture_count:03d}.npz",
+                    positions=np.asarray(
+                        [position for position, _ in selected], dtype=np.int32
+                    ),
+                    forward_rows=np.full(
+                        len(selected), positions.numel(), dtype=np.int32
+                    ),
+                    logits=logits.detach().float().cpu().numpy(),
+                )
+                self._hero_decode_capture_count += 1
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
