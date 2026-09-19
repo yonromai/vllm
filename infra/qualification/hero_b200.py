@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v6",
+    "qualification-9d1ccba766-v7",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -178,6 +179,22 @@ def _master_address(client, task_index: int) -> str:
 
 def _rank_indices(arrays: dict[str, np.ndarray], rank: int) -> np.ndarray:
     return np.flatnonzero(arrays["score_case_indices"] == rank)
+
+
+def _wait_for_all_ranks(client, global_rank: int) -> None:
+    """Keep each EP engine alive until every distinct-length case has finished."""
+    ready_uri = f"{RESULT_ROOT}/ready-rank-{global_rank}.json"
+    _put_json(client, ready_uri, {"rank": global_rank})
+    bucket, prefix = _s3_parts(f"{RESULT_ROOT}/ready-rank-")
+    expected = {f"{prefix}{rank}.json" for rank in range(WORLD_SIZE)}
+    deadline = time.monotonic() + 7 * 3600
+    while time.monotonic() < deadline:
+        response = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        present = {item["Key"] for item in response.get("Contents", [])}
+        if expected <= present:
+            return
+        time.sleep(2)
+    raise TimeoutError(f"Timed out waiting for all ranks at {RESULT_ROOT}")
 
 
 def _top_by_rank(logprobs: dict[int, Any], count: int = 5) -> list[int]:
@@ -395,6 +412,7 @@ def _run_rank(
         [{"prompt_token_ids": tokens[:1]}],
         SamplingParams(
             trace_decode_token_ids=tokens[1:],
+            max_tokens=len(tokens) - 1,
             logprobs=TOP_LOGPROBS,
             temperature=0,
             detokenize=False,
@@ -474,6 +492,19 @@ def _run_rank(
         "cached_decode": decode,
     }
     Path(output_path).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    _wait_for_all_ranks(_s3_client(), global_rank)
+    llm.llm_engine.engine_core.shutdown()
+
+
+def _run_rank_safe(*args) -> None:
+    try:
+        _run_rank(*args)
+    except BaseException:
+        # vLLM's engine children otherwise keep multiprocessing's exit hook
+        # waiting before Python prints the original rank exception.
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
 
 
 def main() -> None:
@@ -538,7 +569,7 @@ def main() -> None:
         global_rank = task_index * LOCAL_WORLD_SIZE + local_rank
         output_path = local_root / f"rank-{global_rank}.json"
         process = context.Process(
-            target=_run_rank,
+            target=_run_rank_safe,
             args=(
                 local_rank,
                 global_rank,
@@ -552,23 +583,30 @@ def main() -> None:
         process.start()
         processes.append((global_rank, output_path, process))
 
-    failures = []
-    for global_rank, output_path, process in processes:
-        process.join()
-        if process.exitcode != 0:
-            failures.append((global_rank, process.exitcode))
+    while True:
+        failures = [
+            (global_rank, process.exitcode)
+            for global_rank, _, process in processes
+            if process.exitcode is not None and process.exitcode != 0
+        ]
+        if failures or all(process.exitcode == 0 for _, _, process in processes):
+            break
+        time.sleep(2)
+    if failures:
+        for global_rank, output_path, process in processes:
+            if process.exitcode in (None, 0):
+                continue
             log_path = output_path.with_suffix(".log")
             if log_path.exists():
                 log_uri = f"{RESULT_ROOT}/rank-{global_rank}.log"
                 bucket, key = _s3_parts(log_uri)
                 client.upload_file(str(log_path), bucket, key)
                 print(f"uploaded failure log {log_uri}", flush=True)
-            continue
+        raise RuntimeError(f"Qualification ranks failed: {failures}")
+    for global_rank, output_path, _ in processes:
         result_uri = f"{RESULT_ROOT}/rank-{global_rank}.json"
         _put_json(client, result_uri, json.loads(output_path.read_text()))
         print(f"uploaded {result_uri}", flush=True)
-    if failures:
-        raise RuntimeError(f"Qualification ranks failed: {failures}")
 
 
 def submit(iris_config: Path) -> None:
