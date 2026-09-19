@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -13,6 +14,7 @@ import multiprocessing as mp
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -38,12 +40,13 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v2",
+    "qualification-9d1ccba766-v3",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
 MASTER_PORT = 29555
+SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
@@ -120,6 +123,27 @@ def _task_index() -> int:
     if match is None:
         raise ValueError(f"Cannot parse Iris task index from {task_id!r}")
     return int(match.group(1))
+
+
+def _configure_node_network() -> None:
+    host = os.environ["IRIS_ADVERTISE_HOST"]
+    packed_host = socket.inet_aton(host)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        for _, interface in socket.if_nameindex():
+            request = struct.pack("256s", interface.encode()[:15])
+            try:
+                address = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, request)[20:24]
+            except OSError:
+                continue
+            if address == packed_host:
+                os.environ["VLLM_HOST_IP"] = host
+                os.environ["GLOO_SOCKET_IFNAME"] = interface
+                print(
+                    f"vLLM node network: host={host} gloo_interface={interface}",
+                    flush=True,
+                )
+                return
+    raise RuntimeError(f"No local network interface owns advertised IP {host}")
 
 
 def _job_key() -> str:
@@ -273,7 +297,6 @@ def _run_rank(
             "VLLM_DP_MASTER_PORT": str(MASTER_PORT),
             "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
             "VLLM_USE_V2_MODEL_RUNNER": "1",
-            "VLLM_ALL2ALL_BACKEND": "allgather_reducescatter",
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
         }
     )
@@ -300,6 +323,7 @@ def _run_rank(
         },
         tensor_parallel_size=1,
         enable_expert_parallel=True,
+        all2all_backend="allgather_reducescatter",
         enforce_eager=True,
         enable_prefix_caching=False,
         enable_trace_replay=True,
@@ -440,6 +464,7 @@ def _run_rank(
 
 def main() -> None:
     task_index = _task_index()
+    _configure_node_network()
     client = _s3_client()
     master_addr = _master_address(client, task_index)
     local_root = Path("/tmp/hero-vllm-qualification")
