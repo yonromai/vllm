@@ -40,7 +40,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v4",
+    "qualification-9d1ccba766-v5",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -144,6 +144,12 @@ def _configure_node_network() -> None:
                 )
                 return
     raise RuntimeError(f"No local network interface owns advertised IP {host}")
+
+
+def _configure_object_storage() -> None:
+    # RunAI's S3 listing builds its own boto3 client. Botocore chooses path
+    # addressing for this custom endpoint unless the shared profile says virtual.
+    os.environ["AWS_CONFIG_FILE"] = str(Path(__file__).with_name("aws-config"))
 
 
 def _job_key() -> str:
@@ -470,6 +476,7 @@ def _run_rank(
 
 def main() -> None:
     task_index = _task_index()
+    _configure_object_storage()
     _configure_node_network()
     client = _s3_client()
     master_addr = _master_address(client, task_index)
