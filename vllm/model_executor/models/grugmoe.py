@@ -1431,6 +1431,7 @@ class GrugMoeForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
         self._hero_decode_capture_count = 0
+        self._hero_decode_seen_positions: set[int] = set()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1486,7 +1487,10 @@ class GrugMoeForCausalLM(
                 for position in wanted
             ]
             selected = [
-                (position, index) for position, index in matches if index.numel() == 1
+                (position, index)
+                for position, index in matches
+                if index.numel() == 1
+                and position not in self._hero_decode_seen_positions
             ]
             if selected:
                 if hidden_states.shape[0] != positions.shape[0]:
@@ -1507,6 +1511,9 @@ class GrugMoeForCausalLM(
                         len(selected), positions.numel(), dtype=np.int32
                     ),
                     logits=logits.detach().float().cpu().numpy(),
+                )
+                self._hero_decode_seen_positions.update(
+                    position for position, _ in selected
                 )
                 self._hero_decode_capture_count += 1
         return hidden_states

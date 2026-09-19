@@ -41,12 +41,12 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v36-all-mode-logits",
+    "qualification-9d1ccba766-v37-scored-all-mode-logits",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
-MASTER_PORT = 43813
+MASTER_PORT = 43837
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
@@ -360,7 +360,16 @@ def _run_rank(
     os.environ["HERO_FULL_LOGITS_PATH"] = str(
         Path(output_path).with_suffix(".full-logits.npz")
     )
-    decode_positions = full_logit_positions
+    windows = [(max(1, valid_length - 32), valid_length)]
+    if valid_length >= 4095:
+        windows.append((2040, 2052))
+    decode_positions = sorted(
+        {
+            position
+            for position in full_logit_positions
+            if any(start - 1 <= position < end - 1 for start, end in windows)
+        }
+    )
     os.environ["HERO_DECODE_LOGITS_POSITIONS"] = json.dumps(decode_positions)
     os.environ["HERO_DECODE_LOGITS_DIR"] = str(
         Path(output_path).with_suffix(".decode-logits")
@@ -439,9 +448,6 @@ def _run_rank(
     # covers every case; the long cases also score a short decode crossing the
     # 2,048-token attention boundary without replaying thousands of unscored
     # intermediate tokens.
-    windows = [(max(1, valid_length - 32), valid_length)]
-    if valid_length >= 4095:
-        windows.append((2040, 2052))
     # Queue both windows together: offline DP/EP must keep every rank in the
     # same engine wave until all ranks have completed their collective steps.
     decode_outputs = llm.generate(
