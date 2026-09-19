@@ -122,6 +122,9 @@ def _mode_metrics(native: NativeEnvelope, case: int, mode: dict) -> tuple[float,
             row["saved_top_logprobs_observed"],
             strict=True,
         ):
+            if observed is None:
+                max_top_probability = float("inf")
+                continue
             max_top_probability = max(
                 max_top_probability,
                 _outside(
@@ -148,6 +151,10 @@ def _pair_metrics(
         target = int(left_row["target_token_id"])
         if target != int(right_row["target_token_id"]):
             raise ValueError(f"Target changed at case {case}, position {position}")
+        if left_row["golden_top_token_ids"] != right_row["golden_top_token_ids"]:
+            raise ValueError(
+                f"Native top IDs changed at case {case}, position {position}"
+            )
         max_target = max(
             max_target,
             abs(
@@ -170,7 +177,10 @@ def _pair_metrics(
                 strict=True,
             )
         )
-        for token in left_top.keys() & right_top.keys():
+        for token in left_top:
+            if left_top[token] is None or right_top[token] is None:
+                max_top_probability = float("inf")
+                continue
             max_top_probability = max(
                 max_top_probability,
                 abs(float(np.exp(left_top[token]) - np.exp(right_top[token])))
@@ -232,6 +242,7 @@ def main() -> None:
     parser.add_argument("--native-arrays", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--ranks", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     with np.load(args.native_arrays) as arrays:
         native = NativeEnvelope({key: arrays[key] for key in arrays.files})
@@ -239,7 +250,11 @@ def main() -> None:
     ranks = [
         json.loads((args.ranks / f"rank-{rank}.json").read_text()) for rank in range(8)
     ]
-    print(json.dumps(evaluate(native, report, ranks), indent=2, sort_keys=True))
+    result = json.dumps(evaluate(native, report, ranks), indent=2, sort_keys=True)
+    if args.output is None:
+        print(result)
+    else:
+        args.output.write_text(result + "\n")
 
 
 if __name__ == "__main__":

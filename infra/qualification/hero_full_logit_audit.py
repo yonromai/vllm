@@ -57,12 +57,25 @@ def audit(
     captured_logits: list[dict[str, np.ndarray]],
 ) -> dict:
     score_parity = {}
+    identity_parity = {}
     for case, (original, captured) in enumerate(
         zip(original_ranks, captured_ranks, strict=True)
     ):
         score_parity[str(case)] = {
             mode: original[mode] == captured[mode]
             for mode in ("short", "prefill", "cached_decode")
+        }
+        identity_parity[str(case)] = {
+            field: original[field] == captured[field]
+            for field in (
+                "checkpoint",
+                "golden_root",
+                "weight_root",
+                "vllm_revision",
+                "input_evidence",
+                "serving_config",
+                "tolerances_fixed_before_run",
+            )
         }
 
     positions = []
@@ -80,6 +93,13 @@ def audit(
         if len(hits) != 1:
             raise ValueError(f"Expected one captured logit row for {case}/{position}")
         alternatives = _matching_native_logits(native_arrays, case, position)
+        observed_probabilities = _probabilities(captured["logits"][hits[0]])
+        scored_row = next(
+            row
+            for row in captured_ranks[case]["prefill"]["positions"]
+            if int(row["prediction_position"]) == position
+        )
+        target = int(scored_row["target_token_id"])
         comparisons = [
             {
                 "native_case": int(native_arrays["full_logit_case_indices"][other]),
@@ -105,6 +125,10 @@ def audit(
             {
                 "case": case,
                 "position": position,
+                "api_target_logprob_difference": float(
+                    np.log(observed_probabilities[target])
+                    - float(scored_row["target_logprob_observed"])
+                ),
                 "same_shape": comparisons[alternatives.index(index)],
                 "closest_native": min(
                     comparisons, key=lambda value: value["total_variation"]
@@ -114,8 +138,12 @@ def audit(
         )
     return {
         "score_parity": score_parity,
+        "identity_parity": identity_parity,
         "all_scores_identical": all(
             same for modes in score_parity.values() for same in modes.values()
+        ),
+        "all_inputs_identical": all(
+            same for fields in identity_parity.values() for same in fields.values()
         ),
         "positions": positions,
     }
@@ -126,6 +154,7 @@ def main() -> None:
     parser.add_argument("--native-arrays", type=Path, required=True)
     parser.add_argument("--original-ranks", type=Path, required=True)
     parser.add_argument("--captured-ranks", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     with np.load(args.native_arrays) as source:
         native = {name: source[name] for name in source.files}
@@ -141,7 +170,11 @@ def main() -> None:
     for rank in range(8):
         with np.load(args.captured_ranks / f"rank-{rank}.full-logits.npz") as source:
             logits.append({name: source[name] for name in source.files})
-    print(json.dumps(audit(native, original, captured, logits), indent=2))
+    result = json.dumps(audit(native, original, captured, logits), indent=2) + "\n"
+    if args.output is None:
+        print(result, end="")
+    else:
+        args.output.write_text(result)
 
 
 if __name__ == "__main__":

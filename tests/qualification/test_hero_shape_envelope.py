@@ -71,3 +71,42 @@ def test_shape_envelope_keeps_top1_gate_while_accepting_native_range() -> None:
     result = evaluate(NativeEnvelope(_native_arrays()), report, [rank])
     assert result["adjusted_failed"] == ["case-0/prefill/top1-mismatches"]
     assert result["gates"][0]["observed"] == 0.0
+
+
+def test_missing_saved_top_probability_cannot_pass_envelope() -> None:
+    row = {
+        "prediction_position": 0,
+        "target_token_id": 7,
+        "target_logprob_observed": -1.0,
+        "golden_top_token_ids": [10, 11],
+        "saved_top_logprobs_observed": [None, -1.0],
+    }
+    rank = {
+        "case_index": 0,
+        "short": {"positions": [row]},
+        "prefill": {"positions": [row]},
+        "cached_decode": {"positions": [row]},
+    }
+    report = {
+        "gates": [
+            {
+                "name": "case-0/prefill/saved-top-probability",
+                "observed": float("inf"),
+                "expected": 0.02,
+                "relation": "le",
+                "passed": False,
+            },
+            {
+                "name": "case-0/prefill-vs-cached-decode/saved-top-probability",
+                "observed": float("inf"),
+                "expected": 0.02,
+                "relation": "le",
+                "passed": False,
+            },
+        ]
+    }
+    result = evaluate(NativeEnvelope(_native_arrays()), report, [rank])
+    assert result["adjusted_failed"] == [
+        "case-0/prefill/saved-top-probability",
+        "case-0/prefill-vs-cached-decode/saved-top-probability",
+    ]

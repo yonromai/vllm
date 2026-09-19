@@ -41,12 +41,12 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v33-full-logits-audit",
+    "qualification-9d1ccba766-v34-all-scored-logits",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
-MASTER_PORT = 43691
+MASTER_PORT = 43731
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
@@ -342,21 +342,15 @@ def _run_rank(
     with np.load(golden_path, allow_pickle=False) as source:
         arrays = {name: source[name] for name in source.files}
     valid_length = int(arrays["valid_lengths"][global_rank])
+    prediction_indices = _rank_indices(arrays, global_rank)
     full_logit_positions = [
-        int(position)
-        for case, position in zip(
-            arrays["full_logit_case_indices"],
-            arrays["full_logit_prediction_positions"],
-            strict=True,
-        )
-        if int(case) == global_rank
+        int(position) for position in arrays["prediction_positions"][prediction_indices]
     ]
     os.environ["HERO_FULL_LOGITS_POSITIONS"] = json.dumps(full_logit_positions)
     os.environ["HERO_FULL_LOGITS_PATH"] = str(
         Path(output_path).with_suffix(".full-logits.npz")
     )
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
-    prediction_indices = _rank_indices(arrays, global_rank)
 
     llm = LLM(
         model=config_dir,
