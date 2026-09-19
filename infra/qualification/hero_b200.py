@@ -21,6 +21,7 @@ from typing import Any
 
 import boto3
 import numpy as np
+from botocore.config import Config
 
 CHECKPOINT = (
     "s3://marin-us-east-02a/marin/grug/hero-ragged_a2a-nccl2307-ep-step81k/"
@@ -37,7 +38,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v1",
+    "qualification-9d1ccba766-v2",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -81,7 +82,11 @@ def _s3_parts(uri: str) -> tuple[str, str]:
 
 
 def _s3_client():
-    return boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"))
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+        config=Config(s3={"addressing_style": "virtual"}),
+    )
 
 
 def _download(client, uri: str, target: Path) -> None:

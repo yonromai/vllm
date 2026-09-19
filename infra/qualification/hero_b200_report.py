@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from hero_b200 import (
     PREFILL_DECODE_TARGET_TOLERANCE,
     PREFILL_DECODE_TOP_PROBABILITY_TOLERANCE,
@@ -31,7 +32,11 @@ def _s3_parts(uri: str) -> tuple[str, str]:
 
 
 def _client():
-    return boto3.client("s3", endpoint_url=os.environ.get("AWS_ENDPOINT_URL"))
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+        config=Config(s3={"addressing_style": "virtual"}),
+    )
 
 
 def _read_json(client, uri: str) -> dict[str, Any]:
