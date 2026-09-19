@@ -2,12 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
+import json
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1437,12 +1441,36 @@ class GrugMoeForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
+        hidden_states = self.model(
             input_ids,
             positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        capture_path = os.environ.get("HERO_FULL_LOGITS_PATH")
+        if capture_path is not None and isinstance(hidden_states, torch.Tensor):
+            path = Path(capture_path)
+            if not path.exists():
+                wanted = json.loads(os.environ["HERO_FULL_LOGITS_POSITIONS"])
+                matches = [
+                    torch.nonzero(positions == position).flatten()
+                    for position in wanted
+                ]
+                if all(index.numel() == 1 for index in matches):
+                    if hidden_states.shape[0] != positions.shape[0]:
+                        raise ValueError(
+                            "Hero logit capture rows do not match positions"
+                        )
+                    selected = torch.cat(matches)
+                    logits = self.compute_logits(hidden_states[selected])
+                    if logits is None:
+                        raise ValueError("Hero logit capture returned no logits")
+                    np.savez_compressed(
+                        path,
+                        positions=np.asarray(wanted, dtype=np.int32),
+                        logits=logits.detach().float().cpu().numpy(),
+                    )
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)

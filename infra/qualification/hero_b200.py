@@ -41,7 +41,7 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v10",
+    "qualification-9d1ccba766-v32-full-logits-audit",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
@@ -342,6 +342,19 @@ def _run_rank(
     with np.load(golden_path, allow_pickle=False) as source:
         arrays = {name: source[name] for name in source.files}
     valid_length = int(arrays["valid_lengths"][global_rank])
+    full_logit_positions = [
+        int(position)
+        for case, position in zip(
+            arrays["full_logit_case_indices"],
+            arrays["full_logit_prediction_positions"],
+            strict=True,
+        )
+        if int(case) == global_rank
+    ]
+    os.environ["HERO_FULL_LOGITS_POSITIONS"] = json.dumps(full_logit_positions)
+    os.environ["HERO_FULL_LOGITS_PATH"] = str(
+        Path(output_path).with_suffix(".full-logits.npz")
+    )
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
     prediction_indices = _rank_indices(arrays, global_rank)
 
@@ -661,6 +674,13 @@ def main() -> None:
         result_uri = f"{RESULT_ROOT}/rank-{global_rank}.json"
         _put_json(client, result_uri, json.loads(output_path.read_text()))
         print(f"uploaded {result_uri}", flush=True)
+        logits_path = output_path.with_suffix(".full-logits.npz")
+        if not logits_path.exists():
+            raise RuntimeError(f"Missing full-logit capture for rank {global_rank}")
+        logits_uri = f"{RESULT_ROOT}/rank-{global_rank}.full-logits.npz"
+        bucket, key = _s3_parts(logits_uri)
+        client.upload_file(str(logits_path), bucket, key)
+        print(f"uploaded {logits_uri}", flush=True)
 
 
 def submit(iris_config: Path) -> None:
