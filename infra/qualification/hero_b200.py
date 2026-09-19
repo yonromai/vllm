@@ -41,12 +41,12 @@ WEIGHT_ROOT = (
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "qualification-9d1ccba766-v35-cached-full-logits",
+    "qualification-9d1ccba766-v36-all-mode-logits",
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
 LOCAL_WORLD_SIZE = 4
-MASTER_PORT = 43771
+MASTER_PORT = 43813
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
@@ -343,6 +343,16 @@ def _run_rank(
         arrays = {name: source[name] for name in source.files}
     valid_length = int(arrays["valid_lengths"][global_rank])
     prediction_indices = _rank_indices(arrays, global_rank)
+    early_indices = prediction_indices[
+        arrays["prediction_positions"][prediction_indices] < min(valid_length - 1, 31)
+    ]
+    short_logit_positions = [
+        int(position) for position in arrays["prediction_positions"][early_indices]
+    ]
+    os.environ["HERO_SHORT_LOGITS_POSITIONS"] = json.dumps(short_logit_positions)
+    os.environ["HERO_SHORT_LOGITS_PATH"] = str(
+        Path(output_path).with_suffix(".short-logits.npz")
+    )
     full_logit_positions = [
         int(position) for position in arrays["prediction_positions"][prediction_indices]
     ]
@@ -350,7 +360,7 @@ def _run_rank(
     os.environ["HERO_FULL_LOGITS_PATH"] = str(
         Path(output_path).with_suffix(".full-logits.npz")
     )
-    decode_positions = {4: [2044], 6: [2048], 7: [2047, 2048]}.get(global_rank, [])
+    decode_positions = full_logit_positions
     os.environ["HERO_DECODE_LOGITS_POSITIONS"] = json.dumps(decode_positions)
     os.environ["HERO_DECODE_LOGITS_DIR"] = str(
         Path(output_path).with_suffix(".decode-logits")
@@ -384,9 +394,6 @@ def _run_rank(
         disable_custom_all_reduce=True,
     )
 
-    early_indices = prediction_indices[
-        arrays["prediction_positions"][prediction_indices] < min(valid_length - 1, 31)
-    ]
     short_tokens = tokens[: min(valid_length, 32)]
     short_output = llm.generate(
         [{"prompt_token_ids": short_tokens}],
@@ -688,6 +695,15 @@ def main() -> None:
         result_uri = f"{RESULT_ROOT}/rank-{global_rank}.json"
         _put_json(client, result_uri, json.loads(output_path.read_text()))
         print(f"uploaded {result_uri}", flush=True)
+        short_path = output_path.with_suffix(".short-logits.npz")
+        if not short_path.exists():
+            raise RuntimeError(
+                f"Missing short full-logit capture for rank {global_rank}"
+            )
+        short_uri = f"{RESULT_ROOT}/rank-{global_rank}.short-logits.npz"
+        bucket, key = _s3_parts(short_uri)
+        client.upload_file(str(short_path), bucket, key)
+        print(f"uploaded {short_uri}", flush=True)
         logits_path = output_path.with_suffix(".full-logits.npz")
         if not logits_path.exists():
             raise RuntimeError(f"Missing full-logit capture for rank {global_rank}")

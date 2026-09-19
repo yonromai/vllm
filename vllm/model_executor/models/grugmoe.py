@@ -1448,29 +1448,32 @@ class GrugMoeForCausalLM(
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
-        capture_path = os.environ.get("HERO_FULL_LOGITS_PATH")
-        if capture_path is not None and isinstance(hidden_states, torch.Tensor):
-            path = Path(capture_path)
-            if not path.exists():
-                wanted = json.loads(os.environ["HERO_FULL_LOGITS_POSITIONS"])
+        if isinstance(hidden_states, torch.Tensor):
+            for mode in ("SHORT", "FULL"):
+                capture_path = os.environ.get(f"HERO_{mode}_LOGITS_PATH")
+                if capture_path is None:
+                    continue
+                path = Path(capture_path)
+                if path.exists():
+                    continue
+                wanted = json.loads(os.environ[f"HERO_{mode}_LOGITS_POSITIONS"])
                 matches = [
                     torch.nonzero(positions == position).flatten()
                     for position in wanted
                 ]
-                if all(index.numel() == 1 for index in matches):
-                    if hidden_states.shape[0] != positions.shape[0]:
-                        raise ValueError(
-                            "Hero logit capture rows do not match positions"
-                        )
-                    selected = torch.cat(matches)
-                    logits = self.compute_logits(hidden_states[selected])
-                    if logits is None:
-                        raise ValueError("Hero logit capture returned no logits")
-                    np.savez_compressed(
-                        path,
-                        positions=np.asarray(wanted, dtype=np.int32),
-                        logits=logits.detach().float().cpu().numpy(),
-                    )
+                if not all(index.numel() == 1 for index in matches):
+                    continue
+                if hidden_states.shape[0] != positions.shape[0]:
+                    raise ValueError("Hero logit capture rows do not match positions")
+                selected = torch.cat(matches)
+                logits = self.compute_logits(hidden_states[selected])
+                if logits is None:
+                    raise ValueError("Hero logit capture returned no logits")
+                np.savez_compressed(
+                    path,
+                    positions=np.asarray(wanted, dtype=np.int32),
+                    logits=logits.detach().float().cpu().numpy(),
+                )
         decode_dir = os.environ.get("HERO_DECODE_LOGITS_DIR")
         if (
             decode_dir is not None
