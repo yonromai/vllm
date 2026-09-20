@@ -170,6 +170,42 @@ def _gate(name: str, value: Any, expected: Any, relation: str) -> dict[str, Any]
     }
 
 
+def _serving_config_provenance(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compare shared settings and retain rank-specific capture instrumentation."""
+    audit_fields = {"layer0_moe_audit", "short_prefix_route_audit_layers"}
+    common = {
+        key: value
+        for key, value in results[0]["serving_config"].items()
+        if key not in audit_fields
+    }
+    for result in results[1:]:
+        other = {
+            key: value
+            for key, value in result["serving_config"].items()
+            if key not in audit_fields
+        }
+        if other != common:
+            raise ValueError("Ranks disagree on serving_config")
+    provenance = {
+        **common,
+        "layer0_moe_audit_ranks": [
+            result["case_index"]
+            for result in results
+            if result["serving_config"].get("layer0_moe_audit", False)
+        ],
+    }
+    short_prefix_audits = {
+        str(result["case_index"]): result["serving_config"].get(
+            "short_prefix_route_audit_layers", []
+        )
+        for result in results
+        if result["serving_config"].get("short_prefix_route_audit_layers")
+    }
+    if short_prefix_audits:
+        provenance["short_prefix_route_audit_layers_by_rank"] = short_prefix_audits
+    return provenance
+
+
 def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]:
     results = sorted(results, key=lambda row: row["case_index"])
     if [row["case_index"] for row in results] != list(range(WORLD_SIZE)):
@@ -190,27 +226,7 @@ def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]
         for field in invariant_fields:
             if result[field] != provenance[field]:
                 raise ValueError(f"Ranks disagree on {field}")
-    serving_config = {
-        key: value
-        for key, value in results[0]["serving_config"].items()
-        if key != "layer0_moe_audit"
-    }
-    for result in results[1:]:
-        other = {
-            key: value
-            for key, value in result["serving_config"].items()
-            if key != "layer0_moe_audit"
-        }
-        if other != serving_config:
-            raise ValueError("Ranks disagree on serving_config")
-    provenance["serving_config"] = {
-        **serving_config,
-        "layer0_moe_audit_ranks": [
-            result["case_index"]
-            for result in results
-            if result["serving_config"].get("layer0_moe_audit", False)
-        ],
-    }
+    provenance["serving_config"] = _serving_config_provenance(results)
 
     cases = []
     gates = []
