@@ -1113,6 +1113,12 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
 
 
 def test_hero_attention_probe_captures_stages_without_changing_output():
+    class DeterministicAttention(nn.Module):
+        def forward(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+        ) -> torch.Tensor:
+            return q + torch.cat((k, k), dim=-1) / 8 + torch.cat((v, v), dim=-1) / 4
+
     cfg = replace(_tiny_hero_config(), sconv=False)
     module = GrugMoeAttention(
         cfg,
@@ -1122,7 +1128,16 @@ def test_hero_attention_probe_captures_stages_without_changing_output():
         use_rope=False,
         qk_mult_scale=1.0,
     )
-    module.attn = _CaptureAttention(module.q_size)
+    module.attn = DeterministicAttention()
+    with torch.no_grad():
+        for projection in (
+            module.q_proj,
+            module.k_proj,
+            module.v_proj,
+            module.o_proj,
+            module.attn_gate,
+        ):
+            _fill_parameter(projection.weight, -0.1, 0.1)
     positions = torch.arange(3)
     hidden_states = torch.arange(3 * cfg.hidden_dim).reshape(3, -1).float() / 100
     stages: dict[str, torch.Tensor] = {}
@@ -1149,6 +1164,11 @@ def test_hero_attention_probe_captures_stages_without_changing_output():
     }
     for value in stages.values():
         assert value.shape[0] == 1
+        assert torch.isfinite(value).all()
+    assert torch.count_nonzero(stages["attn_raw"])
+    torch.testing.assert_close(
+        stages["q_proj"], F.linear(hidden_states[1:2], module.q_proj.weight)
+    )
     torch.testing.assert_close(stages["attn_proj"], ordinary[1:2], atol=0, rtol=0)
 
 
