@@ -1098,12 +1098,22 @@ class GrugMoeAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        capture: tuple[torch.Tensor, dict[str, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
+        def save(site: str, value: torch.Tensor) -> None:
+            if capture is not None:
+                indices, values = capture
+                values[site] = value.index_select(0, indices)
+
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
+        save("q_proj", q)
+        save("k_proj", k)
+        save("v_proj", v)
         if self.sconv_k is not None:
             k = self.sconv_k(k)
+            save("after_sconv_k", k)
 
         num_tokens = hidden_states.shape[0]
         q = _rms_norm(q.view(num_tokens, self.cfg.num_heads, self.head_dim))
@@ -1116,13 +1126,22 @@ class GrugMoeAttention(nn.Module):
         q = q.reshape(num_tokens, self.q_size)
         k = k.reshape(num_tokens, self.kv_size)
         v = v.reshape(num_tokens, self.kv_size)
+        save("q_norm", q)
+        save("k_norm", k)
+        save("v_heads", v)
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
+        save("q_rope", q)
+        save("k_rope", k)
         q = q * self.cfg.qk_mult * self.qk_mult_scale
+        save("q_scaled", q)
 
         attn_output = self.attn(q, k, v)
+        save("attn_raw", attn_output)
         attn_output = self.apply_xsa(hidden_states, attn_output, v)
+        save("after_xsa", attn_output)
         output, _ = self.o_proj(attn_output)
+        save("attn_proj", output)
         return output
 
 
@@ -1286,12 +1305,20 @@ class GrugMoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         trace_after_attn: list[torch.Tensor] | None = None,
         trace_mlp_input: list[torch.Tensor] | None = None,
+        trace_attention: tuple[torch.Tensor, dict[str, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         model_input = hidden_states
         attn_in = self.attn_gated_norm(self.input_layernorm(hidden_states))
-        attn_out = self.self_attn(positions, attn_in)
+        if trace_attention is not None:
+            indices, values = trace_attention
+            values["attn_input"] = attn_in.index_select(0, indices)
+            attn_out = self.self_attn(positions, attn_in, capture=trace_attention)
+        else:
+            attn_out = self.self_attn(positions, attn_in)
         if self.sconv_attn is not None:
             attn_out = self.sconv_attn(attn_out)
+        if trace_attention is not None:
+            values["after_sconv_attn"] = attn_out.index_select(0, indices)
         hidden_states = hidden_states + attn_out
         if trace_after_attn is not None:
             trace_after_attn.append(hidden_states)
@@ -1555,11 +1582,15 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 assert probe_indices is not None
                 after_attn: list[torch.Tensor] = []
                 mlp_input: list[torch.Tensor] = []
+                attention_trace: dict[str, torch.Tensor] = {}
                 hidden_states = layer(
                     positions,
                     hidden_states,
                     trace_after_attn=after_attn,
                     trace_mlp_input=mlp_input,
+                    trace_attention=(probe_indices, attention_trace)
+                    if layer_index == 0
+                    else None,
                 )
                 if len(after_attn) != 1 or len(mlp_input) != 1:
                     raise ValueError(f"Missing Hero layer-{layer_index} boundary")
@@ -1574,6 +1605,10 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                         .float()
                         .cpu()
                         .numpy()
+                    )
+                for site, value in attention_trace.items():
+                    probe_arrays[f"layer_{layer_index}_{site}"] = (
+                        value.detach().float().cpu().numpy()
                     )
             else:
                 hidden_states = layer(positions, hidden_states)

@@ -1112,6 +1112,46 @@ def test_hero_grug_moe_selects_logical_kv_heads_by_layer_type():
     torch.testing.assert_close(global_capture.v, v)
 
 
+def test_hero_attention_probe_captures_stages_without_changing_output():
+    cfg = replace(_tiny_hero_config(), sconv=False)
+    module = GrugMoeAttention(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.float32,
+        sliding_window=cfg.sliding_window,
+        use_rope=False,
+        qk_mult_scale=1.0,
+    )
+    module.attn = _CaptureAttention(module.q_size)
+    positions = torch.arange(3)
+    hidden_states = torch.arange(3 * cfg.hidden_dim).reshape(3, -1).float() / 100
+    stages: dict[str, torch.Tensor] = {}
+
+    captured = module(
+        positions, hidden_states, capture=(torch.tensor([1]), stages)
+    )
+    ordinary = module(positions, hidden_states)
+
+    torch.testing.assert_close(captured, ordinary, atol=0, rtol=0)
+    assert set(stages) == {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "q_norm",
+        "k_norm",
+        "v_heads",
+        "q_rope",
+        "k_rope",
+        "q_scaled",
+        "attn_raw",
+        "after_xsa",
+        "attn_proj",
+    }
+    for value in stages.values():
+        assert value.shape[0] == 1
+    torch.testing.assert_close(stages["attn_proj"], ordinary[1:2], atol=0, rtol=0)
+
+
 def test_grug_moe_attention_schedule_matches_training_architecture():
     cfg = GrugMoeRuntimeConfig(
         vocab_size=32,
