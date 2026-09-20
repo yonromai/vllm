@@ -725,15 +725,23 @@ def test_grug_moe_tpu_accepts_only_unquantized_backend(
 
 
 @pytest.mark.parametrize(
-    ("device", "dtype"),
-    [("cpu", torch.float32), ("cuda", torch.bfloat16)],
+    ("device", "dtype", "down_accumulation_dtype"),
+    [
+        ("cpu", torch.float32, None),
+        ("cpu", torch.float32, torch.float32),
+        ("cuda", torch.bfloat16, None),
+        ("cuda", torch.bfloat16, torch.float32),
+    ],
 )
-def test_grug_gated_norm_matches_reference_math(device: str, dtype: torch.dtype):
+def test_grug_gated_norm_matches_reference_math(
+    device: str, dtype: torch.dtype, down_accumulation_dtype: torch.dtype | None
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is required for the BF16 gated-norm check")
     module = GrugMoeGatedNorm(
         hidden_dim=2,
         params_dtype=dtype,
+        down_accumulation_dtype=down_accumulation_dtype,
     ).to(device)
     x = torch.tensor([[0.2, -0.3], [0.5, 0.7]], device=device, dtype=dtype)
     down_weight = torch.zeros_like(module.down_proj.weight)
@@ -747,7 +755,10 @@ def test_grug_gated_norm_matches_reference_math(device: str, dtype: torch.dtype)
         module.up_proj.weight.copy_(up_weight)
 
     actual = module(x)
-    gate_down = F.linear(x, down_weight)
+    if down_accumulation_dtype is None:
+        gate_down = F.linear(x, down_weight)
+    else:
+        gate_down = F.linear(x.double(), down_weight.double()).to(dtype)
     gate_hidden = F.silu(gate_down)
     gate_up = F.linear(gate_hidden, up_weight)
     gate = torch.sigmoid(gate_up)

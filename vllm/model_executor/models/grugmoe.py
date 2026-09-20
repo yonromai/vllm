@@ -461,8 +461,14 @@ class GrugMoeGatedNorm(nn.Module):
         params_dtype: torch.dtype,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        down_accumulation_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        if down_accumulation_dtype is not None and quant_config is not None:
+            raise ValueError(
+                "FP32 gated-norm down projection requires unquantized weights"
+            )
+        self.down_accumulation_dtype = down_accumulation_dtype
         self.down_proj = ReplicatedLinear(
             hidden_dim,
             _GATED_NORM_RANK,
@@ -488,7 +494,13 @@ class GrugMoeGatedNorm(nn.Module):
         capture: tuple[torch.Tensor, dict[str, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         dtype = x.dtype
-        gate_hidden = _apply_grug_linear(self.down_proj, x)
+        if self.down_accumulation_dtype is None:
+            gate_hidden = _apply_grug_linear(self.down_proj, x)
+        else:
+            gate_hidden = F.linear(
+                x.to(self.down_accumulation_dtype),
+                self.down_proj.weight.to(self.down_accumulation_dtype),
+            ).to(dtype)
         if capture is not None:
             indices, tensors = capture
             tensors["gate_down"] = gate_hidden.index_select(0, indices)
@@ -1338,6 +1350,14 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 self.params_dtype,
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_gated_norm",
+                # A 4K GPU BF16 GEMM can cross a down-logit BF16 midpoint.
+                down_accumulation_dtype=(
+                    torch.float32
+                    if self.params_dtype == torch.bfloat16
+                    and self.quant_config is None
+                    and current_platform.is_cuda()
+                    else None
+                ),
             )
         else:
             self.embed_norm = PPMissingLayer()
