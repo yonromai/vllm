@@ -652,6 +652,54 @@ class GrugMoeMLP(nn.Module):
             router=moe_router,
             router_logits_dtype=torch.float32,
         )
+        self._hero_layer0_audit_path = (
+            os.environ.get("HERO_LAYER0_MOE_AUDIT_PATH")
+            if prefix.endswith("layers.0.mlp")
+            else None
+        )
+
+    def _maybe_capture_layer0_audit(
+        self,
+        positions: torch.Tensor | None,
+        mlp_input: torch.Tensor,
+        routed_input: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed_output: torch.Tensor,
+        expanded_output: torch.Tensor,
+    ) -> None:
+        path_str = self._hero_layer0_audit_path
+        arm_str = os.environ.get("HERO_LAYER0_MOE_AUDIT_ARM_PATH")
+        if (
+            path_str is None
+            or arm_str is None
+            or positions is None
+            or not Path(arm_str).exists()
+            or Path(path_str).exists()
+        ):
+            return
+        wanted = json.loads(os.environ["HERO_LAYER0_MOE_AUDIT_POSITIONS"])
+        matches = [
+            torch.nonzero(positions == position).flatten() for position in wanted
+        ]
+        if not all(index.numel() == 1 for index in matches):
+            return
+        selected = torch.cat(matches)
+        if mlp_input.shape[0] != positions.shape[0]:
+            raise ValueError("Hero layer-0 MoE audit rows do not match positions")
+        weights, expert_ids = self.experts.router._compute_routing(
+            mlp_input[selected], router_logits[selected], torch.int32
+        )
+        np.savez_compressed(
+            path_str,
+            positions=np.asarray(wanted, dtype=np.int32),
+            mlp_input=mlp_input[selected].detach().float().cpu().numpy(),
+            routed_input=routed_input[selected].detach().float().cpu().numpy(),
+            router_logits=router_logits[selected].detach().float().cpu().numpy(),
+            selected_experts=expert_ids.detach().cpu().numpy(),
+            combine_weights=weights.detach().float().cpu().numpy(),
+            routed_output=routed_output[selected].detach().float().cpu().numpy(),
+            after_latent_up=expanded_output[selected].detach().float().cpu().numpy(),
+        )
 
     def _routed_input(self, x_flat: torch.Tensor) -> torch.Tensor:
         if self.latent_down_proj is None or self.latent_norm is None:
@@ -703,7 +751,9 @@ class GrugMoeMLP(nn.Module):
         )
         return self._expand_routed_output(routed_output)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, positions: torch.Tensor | None = None
+    ) -> torch.Tensor:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
         x_flat = x.reshape(-1, hidden_dim)
@@ -716,11 +766,14 @@ class GrugMoeMLP(nn.Module):
             out = self._forward_torch_reference(x_flat, routed_input)
             return out.to(x.dtype).reshape(orig_shape)
         router_logits = _apply_grug_linear(self.router, x_flat.float())
-        out = self.experts(
+        routed_output = self.experts(
             hidden_states=routed_input,
             router_logits=router_logits,
         )
-        out = self._expand_routed_output(out)
+        out = self._expand_routed_output(routed_output)
+        self._maybe_capture_layer0_audit(
+            positions, x_flat, routed_input, router_logits, routed_output, out
+        )
         return out.to(x.dtype).reshape(orig_shape)
 
 
@@ -1131,7 +1184,7 @@ class GrugMoeDecoderLayer(nn.Module):
         hidden_states = hidden_states + attn_out
 
         mlp_in = self.mlp_gated_norm(self.post_attention_layernorm(hidden_states))
-        mlp_out = self.mlp(mlp_in)
+        mlp_out = self.mlp(mlp_in, positions=positions)
         if self.shared_expert is not None:
             mlp_out = mlp_out + self.shared_expert(mlp_in)
         for shared_expert in self.shared_experts:

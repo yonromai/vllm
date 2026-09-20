@@ -338,6 +338,18 @@ def _run_rank(
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
         }
     )
+    layer0_audit_arm = None
+    if global_rank in (6, 7):
+        layer0_audit_path = Path(output_path).with_suffix(".layer0-moe.npz")
+        layer0_audit_arm = Path(output_path).with_suffix(".layer0-moe.armed")
+        os.environ.update(
+            {
+                "HERO_LAYER0_MOE_AUDIT_PATH": str(layer0_audit_path),
+                "HERO_LAYER0_MOE_AUDIT_ARM_PATH": str(layer0_audit_arm),
+                "HERO_LAYER0_MOE_AUDIT_POSITIONS": json.dumps([2046, 2047, 2048]),
+            }
+        )
+        layer0_audit_arm.unlink(missing_ok=True)
     from vllm import LLM, SamplingParams
 
     with np.load(golden_path, allow_pickle=False) as source:
@@ -427,6 +439,8 @@ def _run_rank(
         rank=global_rank,
         prediction_indices=early_indices,
     )
+    if layer0_audit_arm is not None:
+        layer0_audit_arm.touch()
 
     prefill_output = llm.generate(
         [{"prompt_token_ids": tokens}],
@@ -558,6 +572,7 @@ def _run_rank(
             "pipeline_parallel_size": 1,
             "all2all_backend": "allgather_reducescatter",
             "batch_invariant": os.environ["VLLM_BATCH_INVARIANT"] == "1",
+            "layer0_moe_audit": global_rank in (6, 7),
             "attention_backend": "FLASH_ATTN",
             "flash_attn_version": 2,
             "enforce_eager": True,
@@ -731,6 +746,14 @@ def main() -> None:
         bucket, key = _s3_parts(logits_uri)
         client.upload_file(str(logits_path), bucket, key)
         print(f"uploaded {logits_uri}", flush=True)
+        if global_rank in (6, 7):
+            audit_path = output_path.with_suffix(".layer0-moe.npz")
+            if not audit_path.exists():
+                raise RuntimeError(f"Missing layer-0 MoE audit for rank {global_rank}")
+            audit_uri = f"{RESULT_ROOT}/rank-{global_rank}.layer0-moe.npz"
+            bucket, key = _s3_parts(audit_uri)
+            client.upload_file(str(audit_path), bucket, key)
+            print(f"uploaded {audit_uri}", flush=True)
         decode_path = output_path.with_suffix(".decode-logits.npz")
         if decode_path.exists():
             decode_uri = f"{RESULT_ROOT}/rank-{global_rank}.decode-logits.npz"
