@@ -670,11 +670,26 @@ def test_grug_gated_norm_matches_reference_math():
         module.up_proj.weight.copy_(up_weight)
 
     actual = module(x)
-    gate_hidden = F.silu(F.linear(x.float(), down_weight.float()))
-    gate = torch.sigmoid(F.linear(gate_hidden, up_weight.float()))
+    gate_down = F.linear(x.float(), down_weight.float())
+    gate_hidden = F.silu(gate_down)
+    gate_up = F.linear(gate_hidden, up_weight.float())
+    gate = torch.sigmoid(gate_up)
     expected = x * gate
 
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    indices = torch.tensor([1])
+    captured: dict[str, torch.Tensor] = {}
+    traced = module(x, capture=(indices, captured))
+    torch.testing.assert_close(traced, actual, atol=0, rtol=0)
+    for name, stage in (
+        ("gate_down", gate_down),
+        ("gate_silu", gate_hidden),
+        ("gate_up", gate_up),
+        ("gate_sigmoid", gate),
+    ):
+        torch.testing.assert_close(
+            captured[name], stage.index_select(0, indices), atol=0, rtol=0
+        )
 
 
 def test_grug_gated_norm_preserves_projection_dispatch():

@@ -482,12 +482,26 @@ class GrugMoeGatedNorm(nn.Module):
             prefix=f"{prefix}.up_proj",
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        capture: tuple[torch.Tensor, dict[str, torch.Tensor]] | None = None,
+    ) -> torch.Tensor:
         dtype = x.dtype
         gate_hidden = _apply_grug_linear(self.down_proj, x)
+        if capture is not None:
+            indices, tensors = capture
+            tensors["gate_down"] = gate_hidden.index_select(0, indices)
         gate_hidden = F.silu(gate_hidden)
-        gate = _apply_grug_linear(self.up_proj, gate_hidden)
-        return x * torch.sigmoid(gate).to(dtype)
+        if capture is not None:
+            tensors["gate_silu"] = gate_hidden.index_select(0, indices)
+        gate_logits = _apply_grug_linear(self.up_proj, gate_hidden)
+        if capture is not None:
+            tensors["gate_up"] = gate_logits.index_select(0, indices)
+        gate = torch.sigmoid(gate_logits)
+        if capture is not None:
+            tensors["gate_sigmoid"] = gate.index_select(0, indices)
+        return x * gate.to(dtype)
 
 
 class GrugMoeDenseMLP(nn.Module):
@@ -1412,6 +1426,8 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        probe_indices = self._layer_probe_indices(input_ids, positions)
+        embedding_probe: dict[str, torch.Tensor] | None = None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1421,12 +1437,22 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                         "input_ids must be provided when inputs_embeds is None"
                     )
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = self.embed_gated_norm(self.embed_norm(hidden_states))
+            if probe_indices is not None:
+                embedding_probe = {"raw": hidden_states.index_select(0, probe_indices)}
+            hidden_states = self.embed_norm(hidden_states)
+            if embedding_probe is not None:
+                embedding_probe["after_norm"] = hidden_states.index_select(
+                    0, probe_indices
+                )
+                hidden_states = self.embed_gated_norm(
+                    hidden_states, capture=(probe_indices, embedding_probe)
+                )
+            else:
+                hidden_states = self.embed_gated_norm(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        probe_indices = self._layer_probe_indices(input_ids, positions)
         probe_arrays: dict[str, np.ndarray] | None = None
         if probe_indices is not None:
             assert input_ids is not None
@@ -1442,6 +1468,9 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 .cpu()
                 .numpy(),
             }
+            if embedding_probe is not None:
+                for site, value in embedding_probe.items():
+                    probe_arrays[f"embed_{site}"] = value.detach().float().cpu().numpy()
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, None
         )

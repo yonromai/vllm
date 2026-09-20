@@ -50,6 +50,7 @@ LOCAL_WORLD_SIZE = 4
 MASTER_PORT = 43860
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
+GATED_NORM_RANK = 128
 QUALIFICATION_GPUS_PER_TASK = 4
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
 LAYER_PROBE_RANKS = (3, 4, 6, 7)
@@ -551,8 +552,21 @@ def _run_rank(
                 for layer in range(layer_count)
                 for site in ("after_attn", "mlp_input", "after_block")
             ]
+            names.extend(
+                (
+                    "embed_raw",
+                    "embed_after_norm",
+                    "embed_gate_up",
+                    "embed_gate_sigmoid",
+                )
+            )
             for name in names:
                 if trace[name].shape != (len(expected_positions), hidden_dim):
+                    raise ValueError(
+                        f"Bad layer trace {name} shape: {trace[name].shape}"
+                    )
+            for name in ("embed_gate_down", "embed_gate_silu"):
+                if trace[name].shape != (len(expected_positions), GATED_NORM_RANK):
                     raise ValueError(
                         f"Bad layer trace {name} shape: {trace[name].shape}"
                     )
