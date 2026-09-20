@@ -653,16 +653,22 @@ def test_grug_moe_tpu_accepts_only_unquantized_backend(
             _raise_for_unsupported_modes(fake_config)
 
 
-def test_grug_gated_norm_matches_reference_math():
+@pytest.mark.parametrize(
+    ("device", "dtype"),
+    [("cpu", torch.float32), ("cuda", torch.bfloat16)],
+)
+def test_grug_gated_norm_matches_reference_math(device: str, dtype: torch.dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the BF16 gated-norm check")
     module = GrugMoeGatedNorm(
         hidden_dim=2,
-        params_dtype=torch.float32,
-    )
-    x = torch.tensor([[0.2, -0.3], [0.5, 0.7]], dtype=torch.float32)
+        params_dtype=dtype,
+    ).to(device)
+    x = torch.tensor([[0.2, -0.3], [0.5, 0.7]], device=device, dtype=dtype)
     down_weight = torch.zeros_like(module.down_proj.weight)
     up_weight = torch.zeros_like(module.up_proj.weight)
-    down_weight[0] = torch.tensor([1.0, -1.5])
-    down_weight[1] = torch.tensor([-0.25, 0.5])
+    down_weight[0] = torch.tensor([1.0, -1.5], device=device, dtype=dtype)
+    down_weight[1] = torch.tensor([-0.25, 0.5], device=device, dtype=dtype)
     up_weight[0, 0] = 0.75
     up_weight[1, 1] = -0.5
     with torch.no_grad():
@@ -670,14 +676,14 @@ def test_grug_gated_norm_matches_reference_math():
         module.up_proj.weight.copy_(up_weight)
 
     actual = module(x)
-    gate_down = F.linear(x.float(), down_weight.float())
+    gate_down = F.linear(x, down_weight)
     gate_hidden = F.silu(gate_down)
-    gate_up = F.linear(gate_hidden, up_weight.float())
+    gate_up = F.linear(gate_hidden, up_weight)
     gate = torch.sigmoid(gate_up)
     expected = x * gate
 
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
-    indices = torch.tensor([1])
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    indices = torch.tensor([1], device=device)
     captured: dict[str, torch.Tensor] = {}
     traced = module(x, capture=(indices, captured))
     torch.testing.assert_close(traced, actual, atol=0, rtol=0)
