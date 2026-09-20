@@ -30,10 +30,11 @@ CHECKPOINT = (
     "s3://marin-us-east-02a/marin/grug/hero-ragged_a2a-nccl2307-ep-step81k/"
     "2026.08.19.2/checkpoints/step-108000"
 )
-GOLDEN_ROOT = (
+BASELINE_GOLDEN_ROOT = (
     "s3://marin-us-east-02a/marin/reference/hero-forward/"
     "hero-535b-step108000-bf16-v1-dcfe4ced165a"
 )
+GOLDEN_ROOT = os.environ.get("HERO_GOLDEN_ROOT", BASELINE_GOLDEN_ROOT)
 WEIGHT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
     "hero-535b-step108000-bf16-split-v3"
@@ -640,7 +641,9 @@ def main() -> None:
         "effective_weight_dtype": "bfloat16",
         "global_device_count": 32,
         "process_count": 32,
-        "golden_bundle": GOLDEN_ROOT,
+        # The split-v3 weights were exported against the original bundle;
+        # new numerical reference bundles use the same checkpoint and weights.
+        "golden_bundle": BASELINE_GOLDEN_ROOT,
     }
     for field, expected in required_export_fields.items():
         if export_manifest.get(field) != expected:
@@ -731,7 +734,7 @@ def main() -> None:
             print(f"uploaded {decode_uri}", flush=True)
 
 
-def submit(iris_config: Path) -> None:
+def submit(iris_config: Path, golden_root: str, result_root: str) -> None:
     """Submit the fixed two-node B200 qualification job through Iris."""
     from fray.iris_backend import (
         convert_constraints,
@@ -757,7 +760,8 @@ def submit(iris_config: Path) -> None:
         json.dumps(
             {
                 "qualification_revision": revision,
-                "result_root": RESULT_ROOT,
+                "result_root": result_root,
+                "golden_root": golden_root,
                 "weight_root": WEIGHT_ROOT,
             },
             sort_keys=True,
@@ -791,6 +795,8 @@ def submit(iris_config: Path) -> None:
             environment=EnvironmentSpec(
                 env_vars={
                     "HERO_QUALIFICATION_REVISION": revision,
+                    "HERO_GOLDEN_ROOT": golden_root,
+                    "HERO_RESULT_ROOT": result_root,
                     "PYTHONUNBUFFERED": "1",
                 },
                 setup_scripts=[QUALIFICATION_SETUP],
@@ -813,7 +819,9 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("submit")
         parser.add_argument("--iris-config", type=Path, required=True)
+        parser.add_argument("--golden-root", required=True)
+        parser.add_argument("--result-root", required=True)
         args = parser.parse_args()
-        submit(args.iris_config)
+        submit(args.iris_config, args.golden_root, args.result_root)
     else:
         main()
