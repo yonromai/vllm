@@ -6,8 +6,10 @@ import json
 import os
 import tempfile
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -297,6 +299,66 @@ def test_grug_model_returns_requested_eagle3_auxiliary_states():
     assert len(auxiliary_states) == 2
     assert torch.equal(auxiliary_states[0], embedded)
     assert torch.equal(auxiliary_states[1], embedded + 3)
+
+
+@pytest.mark.parametrize(
+    ("device", "dtype"),
+    [("cpu", torch.float32), ("cuda", torch.bfloat16)],
+)
+def test_grug_model_layer_probe_saves_embedding_gate_stages(
+    tmp_path: Path, device: str, dtype: torch.dtype
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the BF16 layer-probe check")
+    model = GrugMoeModel.__new__(GrugMoeModel)
+    nn.Module.__init__(model)
+    model.start_layer = 0
+    model.end_layer = 0
+    model.embed_tokens = nn.Embedding.from_pretrained(
+        torch.arange(16).reshape(4, 4).to(dtype)
+    )
+    model.embed_norm = nn.Identity()
+    model.embed_gated_norm = GrugMoeGatedNorm(hidden_dim=4, params_dtype=dtype)
+    model.layers = nn.ModuleList()
+    model.norm = nn.Identity()
+    model.final_gated_norm = nn.Identity()
+    model._set_aux_hidden_state_layers(())
+    model._layer_probe_path = str(tmp_path / "layer.npz")
+    model._layer_probe_length = 8
+    model._layer_probe_prefix = (1, 3, 0, 2, 1, 3, 0, 2)
+    model._layer_probe_positions = (1,)
+    model._layer_probe_written = False
+    model.to(device)
+    with torch.no_grad():
+        _fill_parameter(model.embed_gated_norm.down_proj.weight, -0.04, 0.03)
+        _fill_parameter(model.embed_gated_norm.up_proj.weight, -0.02, 0.02)
+
+    input_ids = torch.tensor(model._layer_probe_prefix, device=device)
+    output = model.forward(input_ids, torch.arange(8, device=device))
+    untraced_output = model.forward(input_ids, torch.arange(8, device=device))
+    torch.testing.assert_close(output, untraced_output, atol=0, rtol=0)
+    raw = model.embed_tokens(input_ids)[1:2]
+    gate_down = F.linear(raw, model.embed_gated_norm.down_proj.weight)
+    gate_silu = F.silu(gate_down)
+    gate_up = F.linear(gate_silu, model.embed_gated_norm.up_proj.weight)
+    gate = torch.sigmoid(gate_up)
+    torch.testing.assert_close(output[1:2], raw * gate, atol=0, rtol=0)
+
+    with np.load(tmp_path / "layer.npz") as trace:
+        np.testing.assert_array_equal(trace["positions"], [1])
+        np.testing.assert_array_equal(trace["token_ids"], [3])
+        for name, expected in (
+            ("embed_raw", raw),
+            ("embed_after_norm", raw),
+            ("embed_gate_down", gate_down),
+            ("embed_gate_silu", gate_silu),
+            ("embed_gate_up", gate_up),
+            ("embed_gate_sigmoid", gate),
+            ("model_input", output[1:2]),
+        ):
+            np.testing.assert_array_equal(
+                trace[name], expected.detach().float().cpu().numpy()
+            )
 
 
 def test_grug_moe_config_parses_hf_aliases_and_rope_theta():
