@@ -194,6 +194,59 @@ def test_attention_first_load_processes_weights(default_vllm_config, layer_cls):
     assert torch.equal(layer.weight, loaded_weight)
 
 
+def _optional_weight_loader(param, loaded_weight, *, owned=True):
+    if not owned:
+        return False
+    default_weight_loader(param, loaded_weight)
+    return True
+
+
+def test_reload_releases_weights_rejected_by_loader(default_vllm_config):
+    layer = torch.nn.Linear(2, 2)
+    layer.weight.weight_loader = _optional_weight_loader
+    model = torch.nn.Sequential(layer)
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+
+    rejected = torch.ones(2, 2)
+    rejected_ref = ref(rejected)
+    assert layer.weight.weight_loader(layer.weight, rejected, owned=False) is False
+    del rejected
+    gc.collect()
+    assert rejected_ref() is None
+
+    expected = torch.full((2, 2), 3.0)
+    assert layer.weight.weight_loader(layer.weight, expected) is True
+    layer.bias.weight_loader(layer.bias, torch.zeros(2))
+    finalize_layerwise_reload(model, default_vllm_config.model_config)
+    torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
+    torch.testing.assert_close(layer.bias, torch.zeros(2), rtol=0, atol=0)
+
+
+def test_reload_retains_only_weight_slice_of_cuda_transfer_bucket(default_vllm_config):
+    layer = torch.nn.Linear(2, 2, device="cuda")
+    model = torch.nn.Sequential(layer)
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+        initialize_layerwise_reload(model)
+
+    resident = torch.cuda.memory_allocated()
+    bucket = torch.arange(2**24, device="cuda", dtype=torch.float32)
+    weight = bucket[:4].view(2, 2)
+    layer.weight.weight_loader(layer.weight, weight)
+    del weight, bucket
+    gc.collect()
+    torch.cuda.synchronize()
+    # The unfinished layer needs four values, not the 64 MiB transfer bucket.
+    assert torch.cuda.memory_allocated() - resident < 1024**2
+
+    layer.bias.weight_loader(layer.bias, torch.zeros(2, device="cuda"))
+    finalize_layerwise_reload(model, default_vllm_config.model_config)
+    torch.testing.assert_close(
+        layer.weight, torch.arange(4, device="cuda").view(2, 2).float(), rtol=0, atol=0
+    )
+
+
 def test_reload_lifecycle():
     layer = torch.nn.Linear(2, 3)
     info = LayerReloadingInfo(

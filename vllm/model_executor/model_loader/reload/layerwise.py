@@ -184,8 +184,21 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         bound_args.apply_defaults()
 
         # Buffer loaded weights, track loading progress
-        info.loaded_weights.append((param_name, bound_args))
         num_loaded, ret = get_numel_loaded(original_loader, bound_args)
+        if ret is False:
+            # Expert loaders report False for weights owned by another rank.
+            return ret
+        loaded_weight = bound_args.arguments.get("loaded_weight")
+        if (
+            isinstance(loaded_weight, torch.Tensor)
+            and loaded_weight.is_cuda
+            and loaded_weight.untyped_storage().nbytes()
+            > loaded_weight.numel() * loaded_weight.element_size()
+        ):
+            # A small view into an IPC bucket would otherwise retain the entire
+            # bucket until this layer has received every local weight.
+            bound_args.arguments["loaded_weight"] = loaded_weight.clone()
+        info.loaded_weights.append((param_name, bound_args))
         info.load_numel += num_loaded
 
         logger.debug(
