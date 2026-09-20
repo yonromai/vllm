@@ -52,7 +52,10 @@ SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
-LAYER_PROBE_POSITIONS = (0, 1, 2, 3, 4, 5, 6, 7, 2046, 2047, 2048, 2049, 4094, 4095)
+LAYER_PROBE_RANKS = (3, 4, 6, 7)
+LAYER_PROBE_POSITIONS = (
+    0, 1, 2, 3, 4, 5, 6, 7, 2044, 2046, 2047, 2048, 2049, 4094, 4095
+)
 PRECOMPILED_WHEEL = (
     "https://github.com/marin-community/vllm/releases/download/"
     "marin-vllm-gpu-candidate-70ea9ae8f260/"
@@ -414,7 +417,7 @@ def _run_rank(
     os.environ["HERO_DECODE_CAPTURE_ARM_PATH"] = str(decode_capture_arm)
     decode_capture_arm.unlink(missing_ok=True)
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
-    if global_rank in (6, 7):
+    if global_rank in LAYER_PROBE_RANKS:
         os.environ.update(
             {
                 "HERO_LAYER_PROBE_PATH": str(
@@ -527,7 +530,7 @@ def _run_rank(
         short=short_routes,
         prefill=prefill_routes,
     )
-    if global_rank in (6, 7):
+    if global_rank in LAYER_PROBE_RANKS:
         trace_path = Path(output_path).with_suffix(".layer.npz")
         if not trace_path.exists():
             raise RuntimeError(f"Missing layer trace for rank {global_rank}")
@@ -849,7 +852,7 @@ def main() -> None:
         bucket, key = _s3_parts(routes_uri)
         client.upload_file(str(routes_path), bucket, key)
         print(f"uploaded {routes_uri}", flush=True)
-        if global_rank in (6, 7):
+        if global_rank in LAYER_PROBE_RANKS:
             trace_path = output_path.with_suffix(".layer.npz")
             if not trace_path.exists():
                 raise RuntimeError(f"Missing layer trace for rank {global_rank}")
@@ -857,6 +860,7 @@ def main() -> None:
             bucket, key = _s3_parts(trace_uri)
             client.upload_file(str(trace_path), bucket, key)
             print(f"uploaded {trace_uri}", flush=True)
+        if global_rank in (6, 7):
             audit_path = output_path.with_suffix(".layer0-moe.npz")
             if not audit_path.exists():
                 raise RuntimeError(f"Missing layer-0 MoE audit for rank {global_rank}")
