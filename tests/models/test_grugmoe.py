@@ -332,8 +332,15 @@ def test_grug_model_layer_probe_saves_embedding_gate_stages(
     model._layer_probe_written = False
     model.to(device)
     with torch.no_grad():
-        _fill_parameter(model.embed_gated_norm.down_proj.weight, -0.04, 0.03)
-        _fill_parameter(model.embed_gated_norm.up_proj.weight, -0.02, 0.02)
+        down_weight = model.embed_gated_norm.down_proj.weight
+        up_weight = model.embed_gated_norm.up_proj.weight
+        down_weight.zero_()
+        up_weight.zero_()
+        coefficients = torch.tensor(
+            [0.5, -0.25, 0.125, -0.0625], device=device, dtype=dtype
+        )
+        down_weight[0] = coefficients
+        up_weight[:, 0] = coefficients
 
     input_ids = torch.tensor(model._layer_probe_prefix, device=device)
     output = model.forward(input_ids, torch.arange(8, device=device))
