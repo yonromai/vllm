@@ -557,6 +557,7 @@ def _run_rank(
             "moe_capacity_dropping": False,
             "pipeline_parallel_size": 1,
             "all2all_backend": "allgather_reducescatter",
+            "batch_invariant": os.environ["VLLM_BATCH_INVARIANT"] == "1",
             "attention_backend": "FLASH_ATTN",
             "flash_attn_version": 2,
             "enforce_eager": True,
@@ -609,6 +610,10 @@ def _run_rank_safe(*args) -> None:
 
 
 def main() -> None:
+    if os.environ.get("VLLM_BATCH_INVARIANT") != "1":
+        raise RuntimeError(
+            "Hero batch-invariance qualification requires VLLM_BATCH_INVARIANT=1"
+        )
     task_index = _task_index()
     _configure_object_storage()
     _configure_node_network()
@@ -797,6 +802,7 @@ def submit(iris_config: Path, golden_root: str, result_root: str) -> None:
                     "HERO_QUALIFICATION_REVISION": revision,
                     "HERO_GOLDEN_ROOT": golden_root,
                     "HERO_RESULT_ROOT": result_root,
+                    "VLLM_BATCH_INVARIANT": "1",
                     "PYTHONUNBUFFERED": "1",
                 },
                 setup_scripts=[QUALIFICATION_SETUP],
