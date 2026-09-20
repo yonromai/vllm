@@ -292,6 +292,8 @@ def test_grug_model_returns_requested_eagle3_auxiliary_states():
     model._set_aux_hidden_state_layers((0, 2))
     model._layer_probe_path = None
     model._layer_probe_written = False
+    model._decode_layer_probe_path = None
+    model._decode_layer_probe_written = False
     input_ids = torch.tensor([1, 3])
 
     final_hidden_state, auxiliary_states = model.forward(input_ids, torch.arange(2))
@@ -307,7 +309,7 @@ def test_grug_model_returns_requested_eagle3_auxiliary_states():
     ("device", "dtype"),
     [("cpu", torch.float32), ("cuda", torch.bfloat16)],
 )
-def test_grug_model_layer_probe_saves_embedding_gate_stages(
+def test_grug_model_layer_probe_saves_embedding_gate_stages_across_modes(
     tmp_path: Path, device: str, dtype: torch.dtype
 ):
     if device == "cuda" and not torch.cuda.is_available():
@@ -330,6 +332,11 @@ def test_grug_model_layer_probe_saves_embedding_gate_stages(
     model._layer_probe_prefix = (1, 3, 0, 2, 1, 3, 0, 2)
     model._layer_probe_positions = (1,)
     model._layer_probe_written = False
+    model._decode_layer_probe_path = str(tmp_path / "decode-layer.npz")
+    model._decode_layer_probe_position = 1
+    model._decode_layer_probe_token_id = 3
+    model._decode_layer_probe_arm_path = tmp_path / "decode.arm"
+    model._decode_layer_probe_written = False
     model.to(device)
     with torch.no_grad():
         down_weight = model.embed_gated_norm.down_proj.weight
@@ -368,6 +375,23 @@ def test_grug_model_layer_probe_saves_embedding_gate_stages(
             np.testing.assert_array_equal(
                 trace[name], expected.detach().float().cpu().numpy()
             )
+
+    assert not (tmp_path / "decode-layer.npz").exists()
+    model._decode_layer_probe_arm_path.touch()
+    model.forward(input_ids, torch.arange(8, device=device))
+    assert not (tmp_path / "decode-layer.npz").exists()
+    decode_ids = torch.tensor([3], device=device)
+    decode_output = model.forward(decode_ids, torch.tensor([1], device=device))
+    with np.load(tmp_path / "decode-layer.npz") as trace:
+        np.testing.assert_array_equal(trace["positions"], [1])
+        np.testing.assert_array_equal(trace["token_ids"], [3])
+        np.testing.assert_array_equal(
+            trace["model_input"], decode_output.detach().float().cpu().numpy()
+        )
+        np.testing.assert_array_equal(
+            trace["embed_raw"],
+            model.embed_tokens(decode_ids).detach().float().cpu().numpy(),
+        )
 
 
 def test_grug_moe_config_parses_hf_aliases_and_rope_theta():

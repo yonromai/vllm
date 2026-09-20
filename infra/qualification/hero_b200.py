@@ -54,8 +54,10 @@ GATED_NORM_RANK = 128
 QUALIFICATION_GPUS_PER_TASK = 4
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
 LAYER_PROBE_RANKS = (3, 4, 6, 7)
+DECODE_LAYER_PROBE_RANK = 3
+DECODE_LAYER_PROBE_POSITION = 2045
 LAYER_PROBE_POSITIONS = (
-    0, 1, 2, 3, 4, 5, 6, 7, 2044, 2046, 2047, 2048, 2049, 4094, 4095
+    0, 1, 2, 3, 4, 5, 6, 7, 2044, 2045, 2046, 2047, 2048, 2049, 4094, 4095
 )
 PRECOMPILED_WHEEL = (
     "https://github.com/marin-community/vllm/releases/download/"
@@ -418,6 +420,18 @@ def _run_rank(
     os.environ["HERO_DECODE_CAPTURE_ARM_PATH"] = str(decode_capture_arm)
     decode_capture_arm.unlink(missing_ok=True)
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
+    if global_rank == DECODE_LAYER_PROBE_RANK:
+        os.environ.update(
+            {
+                "HERO_DECODE_LAYER_PROBE_PATH": str(
+                    Path(output_path).with_suffix(".decode-layer.npz")
+                ),
+                "HERO_DECODE_LAYER_PROBE_POSITION": str(DECODE_LAYER_PROBE_POSITION),
+                "HERO_DECODE_LAYER_PROBE_TOKEN_ID": str(
+                    tokens[DECODE_LAYER_PROBE_POSITION]
+                ),
+            }
+        )
     if global_rank in LAYER_PROBE_RANKS:
         os.environ.update(
             {
@@ -633,6 +647,17 @@ def _run_rank(
         {"prompt_length": prompt_length, "continuation_length": end - prompt_length}
         for prompt_length, end in windows
     ]
+    if global_rank == DECODE_LAYER_PROBE_RANK:
+        decode_trace_path = Path(output_path).with_suffix(".decode-layer.npz")
+        if not decode_trace_path.exists():
+            raise RuntimeError("Missing Hero cached-decode layer trace")
+        with np.load(decode_trace_path, allow_pickle=False) as trace:
+            if not np.array_equal(trace["positions"], [DECODE_LAYER_PROBE_POSITION]):
+                raise ValueError("Wrong cached-decode layer trace position")
+            if not np.array_equal(
+                trace["token_ids"], [tokens[DECODE_LAYER_PROBE_POSITION]]
+            ):
+                raise ValueError("Wrong cached-decode layer trace token")
     if decode_positions:
         capture_dir = Path(output_path).with_suffix(".decode-logits")
         captures = sorted(capture_dir.glob("*.npz")) if capture_dir.exists() else []
@@ -874,6 +899,12 @@ def main() -> None:
             bucket, key = _s3_parts(trace_uri)
             client.upload_file(str(trace_path), bucket, key)
             print(f"uploaded {trace_uri}", flush=True)
+        if global_rank == DECODE_LAYER_PROBE_RANK:
+            decode_trace_path = output_path.with_suffix(".decode-layer.npz")
+            decode_trace_uri = f"{RESULT_ROOT}/rank-{global_rank}.decode-layer.npz"
+            bucket, key = _s3_parts(decode_trace_uri)
+            client.upload_file(str(decode_trace_path), bucket, key)
+            print(f"uploaded {decode_trace_uri}", flush=True)
         if global_rank in (6, 7):
             audit_path = output_path.with_suffix(".layer0-moe.npz")
             if not audit_path.exists():

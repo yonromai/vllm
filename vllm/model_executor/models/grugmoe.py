@@ -1400,12 +1400,34 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             json.loads(os.environ.get("HERO_LAYER_PROBE_POSITIONS", "[]"))
         )
         self._layer_probe_written = False
+        self._decode_layer_probe_path = os.environ.get(
+            "HERO_DECODE_LAYER_PROBE_PATH"
+        )
+        self._decode_layer_probe_position = int(
+            os.environ.get("HERO_DECODE_LAYER_PROBE_POSITION", "-1")
+        )
+        self._decode_layer_probe_token_id = int(
+            os.environ.get("HERO_DECODE_LAYER_PROBE_TOKEN_ID", "-1")
+        )
+        decode_arm_path = os.environ.get("HERO_DECODE_CAPTURE_ARM_PATH")
+        self._decode_layer_probe_arm_path = (
+            Path(decode_arm_path) if decode_arm_path is not None else None
+        )
+        self._decode_layer_probe_written = False
         if self._layer_probe_path is not None and (
             self._layer_probe_length <= 0
             or len(self._layer_probe_prefix) != 8
             or not self._layer_probe_positions
         ):
             raise ValueError("Hero layer probe requires length, prefix, and positions")
+        if self._decode_layer_probe_path is not None and (
+            self._decode_layer_probe_position < 0
+            or self._decode_layer_probe_token_id < 0
+            or self._decode_layer_probe_arm_path is None
+        ):
+            raise ValueError(
+                "Hero decode layer probe requires position, token, and arm path"
+            )
 
     def _layer_probe_indices(
         self, input_ids: torch.Tensor | None, positions: torch.Tensor
@@ -1436,6 +1458,31 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         ]
         return torch.tensor(valid_positions, device=positions.device)
 
+    def _decode_layer_probe_indices(
+        self, input_ids: torch.Tensor | None, positions: torch.Tensor
+    ) -> torch.Tensor | None:
+        if (
+            self._decode_layer_probe_path is None
+            or self._decode_layer_probe_written
+            or self._decode_layer_probe_arm_path is None
+            or not self._decode_layer_probe_arm_path.exists()
+            or input_ids is None
+            or positions.numel() > 2
+        ):
+            return None
+        indices = torch.nonzero(
+            positions == self._decode_layer_probe_position, as_tuple=False
+        ).flatten()
+        if indices.numel() == 0:
+            return None
+        if (
+            indices.numel() != 1
+            or input_ids.index_select(0, indices).item()
+            != self._decode_layer_probe_token_id
+        ):
+            raise ValueError("Hero decode layer probe position or token mismatch")
+        return indices
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1447,6 +1494,12 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         probe_indices = self._layer_probe_indices(input_ids, positions)
+        probe_path = self._layer_probe_path
+        decode_probe = False
+        if probe_indices is None:
+            probe_indices = self._decode_layer_probe_indices(input_ids, positions)
+            probe_path = self._decode_layer_probe_path
+            decode_probe = probe_indices is not None
         embedding_probe: dict[str, torch.Tensor] | None = None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1477,7 +1530,7 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         if probe_indices is not None:
             assert input_ids is not None
             probe_arrays = {
-                "positions": probe_indices.cpu().numpy(),
+                "positions": positions.index_select(0, probe_indices).cpu().numpy(),
                 "token_ids": input_ids.index_select(0, probe_indices)
                 .detach()
                 .cpu()
@@ -1528,9 +1581,12 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 aux_hidden_states, layer_index + 1, hidden_states, None
             )
         if probe_arrays is not None:
-            assert self._layer_probe_path is not None
-            np.savez_compressed(self._layer_probe_path, **probe_arrays)
-            self._layer_probe_written = True
+            assert probe_path is not None
+            np.savez_compressed(probe_path, **probe_arrays)
+            if decode_probe:
+                self._decode_layer_probe_written = True
+            else:
+                self._layer_probe_written = True
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
         hidden_states = self.final_gated_norm(self.norm(hidden_states))
