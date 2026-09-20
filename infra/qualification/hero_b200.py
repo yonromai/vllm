@@ -341,10 +341,12 @@ def _run_rank(
     layer0_audit_arm = None
     if global_rank in (6, 7):
         layer0_audit_path = Path(output_path).with_suffix(".layer0-moe.npz")
+        layer0_boundary_path = Path(output_path).with_suffix(".layer0-boundary.npz")
         layer0_audit_arm = Path(output_path).with_suffix(".layer0-moe.armed")
         os.environ.update(
             {
                 "HERO_LAYER0_MOE_AUDIT_PATH": str(layer0_audit_path),
+                "HERO_LAYER0_BOUNDARY_AUDIT_PATH": str(layer0_boundary_path),
                 "HERO_LAYER0_MOE_AUDIT_ARM_PATH": str(layer0_audit_arm),
                 "HERO_LAYER0_MOE_AUDIT_POSITIONS": json.dumps([2046, 2047, 2048]),
             }
@@ -754,6 +756,25 @@ def main() -> None:
             bucket, key = _s3_parts(audit_uri)
             client.upload_file(str(audit_path), bucket, key)
             print(f"uploaded {audit_uri}", flush=True)
+            boundary_path = output_path.with_suffix(".layer0-boundary.npz")
+            if not boundary_path.exists():
+                raise RuntimeError(
+                    f"Missing layer-0 boundary audit for rank {global_rank}"
+                )
+            with np.load(boundary_path, allow_pickle=False) as boundary:
+                if not np.array_equal(boundary["positions"], [2046, 2047, 2048]):
+                    raise ValueError(
+                        f"Wrong layer-0 boundary positions for rank {global_rank}"
+                    )
+                for name in ("model_input", "after_attn", "mlp_input"):
+                    if boundary[name].shape != (3, 6144):
+                        raise ValueError(
+                            f"Bad layer-0 {name} shape: {boundary[name].shape}"
+                        )
+            boundary_uri = f"{RESULT_ROOT}/rank-{global_rank}.layer0-boundary.npz"
+            bucket, key = _s3_parts(boundary_uri)
+            client.upload_file(str(boundary_path), bucket, key)
+            print(f"uploaded {boundary_uri}", flush=True)
         decode_path = output_path.with_suffix(".decode-logits.npz")
         if decode_path.exists():
             decode_uri = f"{RESULT_ROOT}/rank-{global_rank}.decode-logits.npz"

@@ -1171,12 +1171,54 @@ class GrugMoeDecoderLayer(nn.Module):
             if cfg.is_hero and cfg.sconv and "mlp" in cfg.sconv_sites
             else None
         )
+        self._hero_layer0_boundary_audit_path = (
+            os.environ.get("HERO_LAYER0_BOUNDARY_AUDIT_PATH")
+            if prefix.endswith("layers.0")
+            else None
+        )
+
+    def _maybe_capture_layer0_boundary_audit(
+        self,
+        positions: torch.Tensor,
+        model_input: torch.Tensor,
+        after_attn: torch.Tensor,
+        mlp_input: torch.Tensor,
+    ) -> None:
+        path_str = self._hero_layer0_boundary_audit_path
+        arm_str = os.environ.get("HERO_LAYER0_MOE_AUDIT_ARM_PATH")
+        if (
+            path_str is None
+            or arm_str is None
+            or not Path(arm_str).exists()
+            or Path(path_str).exists()
+        ):
+            return
+        wanted = json.loads(os.environ["HERO_LAYER0_MOE_AUDIT_POSITIONS"])
+        matches = [
+            torch.nonzero(positions == position).flatten() for position in wanted
+        ]
+        if not all(index.numel() == 1 for index in matches):
+            return
+        selected = torch.cat(matches)
+        if any(
+            value.shape[0] != positions.shape[0]
+            for value in (model_input, after_attn, mlp_input)
+        ):
+            raise ValueError("Hero layer-0 boundary audit rows do not match positions")
+        np.savez_compressed(
+            path_str,
+            positions=np.asarray(wanted, dtype=np.int32),
+            model_input=model_input[selected].detach().float().cpu().numpy(),
+            after_attn=after_attn[selected].detach().float().cpu().numpy(),
+            mlp_input=mlp_input[selected].detach().float().cpu().numpy(),
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        model_input = hidden_states
         attn_in = self.attn_gated_norm(self.input_layernorm(hidden_states))
         attn_out = self.self_attn(positions, attn_in)
         if self.sconv_attn is not None:
@@ -1184,6 +1226,9 @@ class GrugMoeDecoderLayer(nn.Module):
         hidden_states = hidden_states + attn_out
 
         mlp_in = self.mlp_gated_norm(self.post_attention_layernorm(hidden_states))
+        self._maybe_capture_layer0_boundary_audit(
+            positions, model_input, hidden_states, mlp_in
+        )
         mlp_out = self.mlp(mlp_in, positions=positions)
         if self.shared_expert is not None:
             mlp_out = mlp_out + self.shared_expert(mlp_in)
