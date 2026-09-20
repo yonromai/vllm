@@ -1377,14 +1377,6 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 self.params_dtype,
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_gated_norm",
-                # A 4K GPU BF16 GEMM can cross a down-logit BF16 midpoint.
-                down_accumulation_dtype=(
-                    torch.float32
-                    if self.params_dtype == torch.bfloat16
-                    and self.quant_config is None
-                    and current_platform.is_cuda()
-                    else None
-                ),
             )
         else:
             self.embed_norm = PPMissingLayer()
