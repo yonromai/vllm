@@ -294,6 +294,8 @@ def test_grug_model_returns_requested_eagle3_auxiliary_states():
     model._layer_probe_written = False
     model._decode_layer_probe_path = None
     model._decode_layer_probe_written = False
+    model._embed_history_dir = None
+    model._embed_history_arm_path = None
     input_ids = torch.tensor([1, 3])
 
     final_hidden_state, auxiliary_states = model.forward(input_ids, torch.arange(2))
@@ -337,6 +339,8 @@ def test_grug_model_layer_probe_saves_embedding_gate_stages_across_modes(
     model._decode_layer_probe_token_id = 3
     model._decode_layer_probe_arm_path = tmp_path / "decode.arm"
     model._decode_layer_probe_written = False
+    model._embed_history_dir = None
+    model._embed_history_arm_path = None
     model.to(device)
     with torch.no_grad():
         down_weight = model.embed_gated_norm.down_proj.weight
@@ -392,6 +396,65 @@ def test_grug_model_layer_probe_saves_embedding_gate_stages_across_modes(
             trace["embed_raw"],
             model.embed_tokens(decode_ids).detach().float().cpu().numpy(),
         )
+
+
+def test_grug_model_embedding_history_records_full_and_cached_paths(tmp_path: Path):
+    model = GrugMoeModel.__new__(GrugMoeModel)
+    nn.Module.__init__(model)
+    model.start_layer = 0
+    model.end_layer = 0
+    model.embed_tokens = nn.Embedding.from_pretrained(
+        torch.arange(16).reshape(4, 4).float()
+    )
+    model.embed_norm = nn.Identity()
+    model.embed_gated_norm = GrugMoeGatedNorm(hidden_dim=4, params_dtype=torch.float32)
+    model.layers = nn.ModuleList()
+    model.norm = nn.Identity()
+    model.final_gated_norm = nn.Identity()
+    model._set_aux_hidden_state_layers(())
+    model._layer_probe_path = None
+    model._decode_layer_probe_path = None
+    model._embed_history_dir = tmp_path / "history"
+    model._embed_history_arm_path = tmp_path / "decode.arm"
+    model._embed_history_full_length = 12
+    model._embed_history_prefix_length = 10
+    model._embed_history_target = 11
+    model._embed_history_prefix = (1, 3, 0, 2, 1, 3, 0, 2)
+    model._embed_history_written = set()
+    with torch.no_grad():
+        model.embed_gated_norm.down_proj.weight.fill_(0.125)
+        model.embed_gated_norm.up_proj.weight.fill_(0.125)
+
+    ids = torch.tensor([*model._embed_history_prefix, 1, 3, 0, 2])
+    full_output = model.forward(ids, torch.arange(12))
+    with np.load(tmp_path / "history/full.npz") as full:
+        np.testing.assert_array_equal(full["positions"], np.arange(12))
+        np.testing.assert_array_equal(full["token_ids"], ids.numpy())
+        np.testing.assert_array_equal(full["model_input"], full_output.detach().numpy())
+        np.testing.assert_array_equal(
+            full["embed_gate_down"],
+            F.linear(model.embed_tokens(ids), model.embed_gated_norm.down_proj.weight)
+            .detach()
+            .numpy(),
+        )
+
+    model._embed_history_arm_path.touch()
+    prefix_output = model.forward(ids[:10], torch.arange(10))
+    with np.load(tmp_path / "history/prefix.npz") as prefix:
+        np.testing.assert_array_equal(prefix["positions"], np.arange(10))
+        np.testing.assert_array_equal(
+            prefix["model_input"], prefix_output.detach().numpy()
+        )
+    for position in (10, 11):
+        step_output = model.forward(
+            ids[position : position + 1], torch.tensor([position])
+        )
+        with np.load(tmp_path / f"history/step-{position}.npz") as step:
+            np.testing.assert_array_equal(step["positions"], [position])
+            np.testing.assert_array_equal(step["token_ids"], [ids[position].item()])
+            np.testing.assert_array_equal(
+                step["model_input"], step_output.detach().numpy()
+            )
 
 
 def test_grug_moe_config_parses_hf_aliases_and_rope_theta():

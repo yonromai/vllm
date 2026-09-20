@@ -53,9 +53,10 @@ TOP_LOGPROBS = 64
 GATED_NORM_RANK = 128
 QUALIFICATION_GPUS_PER_TASK = 4
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
-LAYER_PROBE_RANKS = (3, 4, 6, 7)
-DECODE_LAYER_PROBE_RANK = 3
+LAYER_PROBE_RANKS = (4, 6, 7)
+DECODE_LAYER_PROBE_RANK = -1
 DECODE_LAYER_PROBE_POSITION = 2045
+EMBED_HISTORY_RANK = 3
 LAYER_PROBE_POSITIONS = (
     0, 1, 2, 3, 4, 5, 6, 7, 2044, 2045, 2046, 2047, 2048, 2049, 4094, 4095
 )
@@ -318,6 +319,51 @@ def _summarize_mode(
     }
 
 
+def _collect_embedding_history(
+    output_path: Path, tokens: list[int], prefix_length: int, target: int
+) -> Path:
+    history_dir = output_path.with_suffix(".embedding-history")
+    sites = ("embed_raw", "embed_after_norm", "embed_gate_down", "model_input")
+
+    def load(name: str, expected_positions: np.ndarray) -> dict[str, np.ndarray]:
+        path = history_dir / f"{name}.npz"
+        if not path.exists():
+            raise RuntimeError(f"Missing Hero embedding history capture: {path}")
+        with np.load(path, allow_pickle=False) as source:
+            arrays = {key: source[key] for key in source.files}
+        if not np.array_equal(arrays["positions"], expected_positions):
+            raise ValueError(f"Wrong Hero embedding history positions in {path}")
+        if not np.array_equal(
+            arrays["token_ids"], np.asarray(tokens)[expected_positions]
+        ):
+            raise ValueError(f"Wrong Hero embedding history tokens in {path}")
+        for site in sites:
+            if arrays[site].shape[0] != len(expected_positions):
+                raise ValueError(
+                    f"Wrong Hero embedding history shape for {site} in {path}"
+                )
+        return arrays
+
+    full = load("full", np.arange(len(tokens)))
+    prefix = load("prefix", np.arange(prefix_length))
+    steps = [
+        load(f"step-{position}", np.asarray([position]))
+        for position in range(prefix_length, target + 1)
+    ]
+    result = {
+        "positions": np.arange(target + 1),
+        "token_ids": np.asarray(tokens[: target + 1]),
+    }
+    for site in sites:
+        result[f"full_{site}"] = full[site][: target + 1]
+        result[f"decode_{site}"] = np.concatenate(
+            [prefix[site], *(step[site] for step in steps)]
+        )
+    aggregate = output_path.with_suffix(".embedding-history.npz")
+    np.savez_compressed(aggregate, **result)
+    return aggregate
+
+
 def _run_rank(
     local_rank: int,
     global_rank: int,
@@ -420,6 +466,20 @@ def _run_rank(
     os.environ["HERO_DECODE_CAPTURE_ARM_PATH"] = str(decode_capture_arm)
     decode_capture_arm.unlink(missing_ok=True)
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
+    if global_rank == EMBED_HISTORY_RANK:
+        if valid_length != 2047:
+            raise ValueError("Hero embedding history probe expects 2047 tokens")
+        os.environ.update(
+            {
+                "HERO_EMBED_HISTORY_DIR": str(
+                    Path(output_path).with_suffix(".embedding-history")
+                ),
+                "HERO_EMBED_HISTORY_FULL_LENGTH": str(valid_length),
+                "HERO_EMBED_HISTORY_PREFIX_LENGTH": str(valid_length - 32),
+                "HERO_EMBED_HISTORY_TARGET": str(DECODE_LAYER_PROBE_POSITION),
+                "HERO_EMBED_HISTORY_PREFIX_TOKENS": json.dumps(tokens[:8]),
+            }
+        )
     if global_rank == DECODE_LAYER_PROBE_RANK:
         os.environ.update(
             {
@@ -658,6 +718,10 @@ def _run_rank(
                 trace["token_ids"], [tokens[DECODE_LAYER_PROBE_POSITION]]
             ):
                 raise ValueError("Wrong cached-decode layer trace token")
+    if global_rank == EMBED_HISTORY_RANK:
+        _collect_embedding_history(
+            Path(output_path), tokens, valid_length - 32, DECODE_LAYER_PROBE_POSITION
+        )
     if decode_positions:
         capture_dir = Path(output_path).with_suffix(".decode-logits")
         captures = sorted(capture_dir.glob("*.npz")) if capture_dir.exists() else []
@@ -905,6 +969,14 @@ def main() -> None:
             bucket, key = _s3_parts(decode_trace_uri)
             client.upload_file(str(decode_trace_path), bucket, key)
             print(f"uploaded {decode_trace_uri}", flush=True)
+        if global_rank == EMBED_HISTORY_RANK:
+            history_path = output_path.with_suffix(".embedding-history.npz")
+            if not history_path.exists():
+                raise RuntimeError("Missing Hero embedding history aggregate")
+            history_uri = f"{RESULT_ROOT}/rank-{global_rank}.embedding-history.npz"
+            bucket, key = _s3_parts(history_uri)
+            client.upload_file(str(history_path), bucket, key)
+            print(f"uploaded {history_uri}", flush=True)
         if global_rank in (6, 7):
             audit_path = output_path.with_suffix(".layer0-moe.npz")
             if not audit_path.exists():

@@ -1441,6 +1441,24 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             Path(decode_arm_path) if decode_arm_path is not None else None
         )
         self._decode_layer_probe_written = False
+        history_dir = os.environ.get("HERO_EMBED_HISTORY_DIR")
+        self._embed_history_dir = Path(history_dir) if history_dir is not None else None
+        self._embed_history_arm_path = (
+            Path(decode_arm_path) if decode_arm_path is not None else None
+        )
+        self._embed_history_full_length = int(
+            os.environ.get("HERO_EMBED_HISTORY_FULL_LENGTH", "0")
+        )
+        self._embed_history_prefix_length = int(
+            os.environ.get("HERO_EMBED_HISTORY_PREFIX_LENGTH", "0")
+        )
+        self._embed_history_target = int(
+            os.environ.get("HERO_EMBED_HISTORY_TARGET", "-1")
+        )
+        self._embed_history_prefix = tuple(
+            json.loads(os.environ.get("HERO_EMBED_HISTORY_PREFIX_TOKENS", "[]"))
+        )
+        self._embed_history_written: set[str] = set()
         if self._layer_probe_path is not None and (
             self._layer_probe_length <= 0
             or len(self._layer_probe_prefix) != 8
@@ -1455,6 +1473,64 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             raise ValueError(
                 "Hero decode layer probe requires position, token, and arm path"
             )
+        if self._embed_history_dir is not None and (
+            self._embed_history_arm_path is None
+            or len(self._embed_history_prefix) != 8
+            or self._embed_history_full_length <= self._embed_history_target
+            or self._embed_history_prefix_length <= 8
+            or self._embed_history_target < self._embed_history_prefix_length
+        ):
+            raise ValueError("Hero embedding history probe has invalid boundaries")
+
+    def _embed_history_capture(
+        self, input_ids: torch.Tensor | None, positions: torch.Tensor
+    ) -> tuple[Path, torch.Tensor, str] | None:
+        if (
+            self._embed_history_dir is None
+            or self._embed_history_arm_path is None
+            or input_ids is None
+            or input_ids.ndim != 1
+            or positions.ndim != 1
+        ):
+            return None
+        armed = self._embed_history_arm_path.exists()
+        label: str
+        if armed and positions.numel() <= 2:
+            indices = torch.nonzero(
+                (positions >= self._embed_history_prefix_length)
+                & (positions <= self._embed_history_target),
+                as_tuple=False,
+            ).flatten()
+            if indices.numel() != 1 or input_ids.numel() <= int(indices.item()):
+                return None
+            label = f"step-{int(positions.index_select(0, indices).item())}"
+            if label in self._embed_history_written:
+                return None
+            return self._embed_history_dir / f"{label}.npz", indices, label
+        expected_length = (
+            self._embed_history_prefix_length
+            if armed
+            else self._embed_history_full_length
+        )
+        if input_ids.numel() < expected_length or positions.numel() < expected_length:
+            return None
+        expected_prefix = torch.tensor(
+            self._embed_history_prefix,
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+        if not torch.equal(input_ids[:8], expected_prefix):
+            return None
+        expected_positions = torch.arange(
+            expected_length, device=positions.device, dtype=positions.dtype
+        )
+        if not torch.equal(positions[:expected_length], expected_positions):
+            return None
+        label = "prefix" if armed else "full"
+        if label in self._embed_history_written:
+            return None
+        indices = torch.arange(expected_length, device=positions.device)
+        return self._embed_history_dir / f"{label}.npz", indices, label
 
     def _layer_probe_indices(
         self, input_ids: torch.Tensor | None, positions: torch.Tensor
@@ -1520,6 +1596,8 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        history_capture = self._embed_history_capture(input_ids, positions)
+        history_label = history_capture[2] if history_capture is not None else None
         probe_indices = self._layer_probe_indices(input_ids, positions)
         probe_path = self._layer_probe_path
         decode_probe = False
@@ -1527,6 +1605,10 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             probe_indices = self._decode_layer_probe_indices(input_ids, positions)
             probe_path = self._decode_layer_probe_path
             decode_probe = probe_indices is not None
+        if history_capture is not None:
+            if probe_indices is not None:
+                raise ValueError("Hero embedding history and layer probes overlap")
+            probe_path, probe_indices, _ = history_capture
         embedding_probe: dict[str, torch.Tensor] | None = None
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1570,6 +1652,12 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             }
             if embedding_probe is not None:
                 for site, value in embedding_probe.items():
+                    if history_label is not None and site not in (
+                        "raw",
+                        "after_norm",
+                        "gate_down",
+                    ):
+                        continue
                     probe_arrays[f"embed_{site}"] = value.detach().float().cpu().numpy()
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, None
@@ -1578,7 +1666,9 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            if probe_arrays is not None:
+            if history_label is not None:
+                hidden_states = layer(positions, hidden_states)
+            elif probe_arrays is not None:
                 assert probe_indices is not None
                 after_attn: list[torch.Tensor] = []
                 mlp_input: list[torch.Tensor] = []
@@ -1617,8 +1707,12 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             )
         if probe_arrays is not None:
             assert probe_path is not None
+            if history_capture is not None:
+                probe_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(probe_path, **probe_arrays)
-            if decode_probe:
+            if history_label is not None:
+                self._embed_history_written.add(history_label)
+            elif decode_probe:
                 self._decode_layer_probe_written = True
             else:
                 self._layer_probe_written = True
