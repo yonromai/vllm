@@ -183,7 +183,6 @@ def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]
         "qualification_revision",
         "runtime",
         "input_evidence",
-        "serving_config",
         "tolerances_fixed_before_run",
     )
     provenance = {field: results[0][field] for field in invariant_fields}
@@ -191,6 +190,27 @@ def aggregate(results: list[dict[str, Any]], result_root: str) -> dict[str, Any]
         for field in invariant_fields:
             if result[field] != provenance[field]:
                 raise ValueError(f"Ranks disagree on {field}")
+    serving_config = {
+        key: value
+        for key, value in results[0]["serving_config"].items()
+        if key != "layer0_moe_audit"
+    }
+    for result in results[1:]:
+        other = {
+            key: value
+            for key, value in result["serving_config"].items()
+            if key != "layer0_moe_audit"
+        }
+        if other != serving_config:
+            raise ValueError("Ranks disagree on serving_config")
+    provenance["serving_config"] = {
+        **serving_config,
+        "layer0_moe_audit_ranks": [
+            result["case_index"]
+            for result in results
+            if result["serving_config"].get("layer0_moe_audit", False)
+        ],
+    }
 
     cases = []
     gates = []
