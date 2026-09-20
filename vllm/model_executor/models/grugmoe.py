@@ -1241,6 +1241,8 @@ class GrugMoeDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        trace_after_attn: list[torch.Tensor] | None = None,
+        trace_mlp_input: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         model_input = hidden_states
         attn_in = self.attn_gated_norm(self.input_layernorm(hidden_states))
@@ -1248,8 +1250,12 @@ class GrugMoeDecoderLayer(nn.Module):
         if self.sconv_attn is not None:
             attn_out = self.sconv_attn(attn_out)
         hidden_states = hidden_states + attn_out
+        if trace_after_attn is not None:
+            trace_after_attn.append(hidden_states)
 
         mlp_in = self.mlp_gated_norm(self.post_attention_layernorm(hidden_states))
+        if trace_mlp_input is not None:
+            trace_mlp_input.append(mlp_in)
         self._maybe_capture_boundary_audit(
             positions, model_input, hidden_states, mlp_in
         )
@@ -1334,6 +1340,50 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.config.hidden_dim
         )
+        self._layer_probe_path = os.environ.get("HERO_LAYER_PROBE_PATH")
+        self._layer_probe_length = int(os.environ.get("HERO_LAYER_PROBE_LENGTH", "0"))
+        self._layer_probe_prefix = tuple(
+            json.loads(os.environ.get("HERO_LAYER_PROBE_PREFIX_TOKENS", "[]"))
+        )
+        self._layer_probe_positions = tuple(
+            json.loads(os.environ.get("HERO_LAYER_PROBE_POSITIONS", "[]"))
+        )
+        self._layer_probe_written = False
+        if self._layer_probe_path is not None and (
+            self._layer_probe_length <= 0
+            or len(self._layer_probe_prefix) != 8
+            or not self._layer_probe_positions
+        ):
+            raise ValueError("Hero layer probe requires length, prefix, and positions")
+
+    def _layer_probe_indices(
+        self, input_ids: torch.Tensor | None, positions: torch.Tensor
+    ) -> torch.Tensor | None:
+        if (
+            self._layer_probe_path is None
+            or self._layer_probe_written
+            or input_ids is None
+            or input_ids.ndim != 1
+            or input_ids.numel() < self._layer_probe_length
+            or positions.numel() < self._layer_probe_length
+        ):
+            return None
+        expected_prefix = torch.tensor(
+            self._layer_probe_prefix, device=input_ids.device, dtype=input_ids.dtype
+        )
+        if not torch.equal(input_ids[: expected_prefix.numel()], expected_prefix):
+            return None
+        expected_positions = torch.arange(
+            self._layer_probe_length, device=positions.device, dtype=positions.dtype
+        )
+        if not torch.equal(positions[: self._layer_probe_length], expected_positions):
+            return None
+        valid_positions = [
+            position
+            for position in self._layer_probe_positions
+            if position < self._layer_probe_length
+        ]
+        return torch.tensor(valid_positions, device=positions.device)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1359,6 +1409,22 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
+        probe_indices = self._layer_probe_indices(input_ids, positions)
+        probe_arrays: dict[str, np.ndarray] | None = None
+        if probe_indices is not None:
+            assert input_ids is not None
+            probe_arrays = {
+                "positions": probe_indices.cpu().numpy(),
+                "token_ids": input_ids.index_select(0, probe_indices)
+                .detach()
+                .cpu()
+                .numpy(),
+                "model_input": hidden_states.index_select(0, probe_indices)
+                .detach()
+                .float()
+                .cpu()
+                .numpy(),
+            }
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, None
         )
@@ -1366,10 +1432,39 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states = layer(positions, hidden_states)
+            if probe_arrays is not None:
+                assert probe_indices is not None
+                after_attn: list[torch.Tensor] = []
+                mlp_input: list[torch.Tensor] = []
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    trace_after_attn=after_attn,
+                    trace_mlp_input=mlp_input,
+                )
+                if len(after_attn) != 1 or len(mlp_input) != 1:
+                    raise ValueError(f"Missing Hero layer-{layer_index} boundary")
+                for site, value in (
+                    ("after_attn", after_attn[0]),
+                    ("mlp_input", mlp_input[0]),
+                    ("after_block", hidden_states),
+                ):
+                    probe_arrays[f"layer_{layer_index}_{site}"] = (
+                        value.index_select(0, probe_indices)
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
+            else:
+                hidden_states = layer(positions, hidden_states)
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_index + 1, hidden_states, None
             )
+        if probe_arrays is not None:
+            assert self._layer_probe_path is not None
+            np.savez_compressed(self._layer_probe_path, **probe_arrays)
+            self._layer_probe_written = True
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
         hidden_states = self.final_gated_norm(self.norm(hidden_states))

@@ -52,6 +52,7 @@ SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = 4
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
+LAYER_PROBE_POSITIONS = (0, 1, 2, 3, 4, 5, 6, 7, 2046, 2047, 2048, 2049, 4094, 4095)
 PRECOMPILED_WHEEL = (
     "https://github.com/marin-community/vllm/releases/download/"
     "marin-vllm-gpu-candidate-70ea9ae8f260/"
@@ -398,6 +399,17 @@ def _run_rank(
     os.environ["HERO_DECODE_CAPTURE_ARM_PATH"] = str(decode_capture_arm)
     decode_capture_arm.unlink(missing_ok=True)
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
+    if global_rank in (6, 7):
+        os.environ.update(
+            {
+                "HERO_LAYER_PROBE_PATH": str(
+                    Path(output_path).with_suffix(".layer.npz")
+                ),
+                "HERO_LAYER_PROBE_LENGTH": str(valid_length),
+                "HERO_LAYER_PROBE_PREFIX_TOKENS": json.dumps(tokens[:8]),
+                "HERO_LAYER_PROBE_POSITIONS": json.dumps(LAYER_PROBE_POSITIONS),
+            }
+        )
 
     llm = LLM(
         model=config_dir,
@@ -468,6 +480,32 @@ def _run_rank(
         rank=global_rank,
         prediction_indices=prediction_indices,
     )
+    if global_rank in (6, 7):
+        trace_path = Path(output_path).with_suffix(".layer.npz")
+        if not trace_path.exists():
+            raise RuntimeError(f"Missing layer trace for rank {global_rank}")
+        expected_positions = np.asarray(
+            [position for position in LAYER_PROBE_POSITIONS if position < valid_length]
+        )
+        model_config = json.loads((Path(config_dir) / "config.json").read_text())
+        layer_count = int(model_config["num_hidden_layers"])
+        hidden_dim = int(model_config["hidden_size"])
+        with np.load(trace_path, allow_pickle=False) as trace:
+            if not np.array_equal(trace["positions"], expected_positions):
+                raise ValueError(f"Wrong layer trace positions for rank {global_rank}")
+            expected_tokens = np.asarray(tokens)[expected_positions]
+            if not np.array_equal(trace["token_ids"], expected_tokens):
+                raise ValueError(f"Wrong layer trace tokens for rank {global_rank}")
+            names = ["model_input"] + [
+                f"layer_{layer}_{site}"
+                for layer in range(layer_count)
+                for site in ("after_attn", "mlp_input", "after_block")
+            ]
+            for name in names:
+                if trace[name].shape != (len(expected_positions), hidden_dim):
+                    raise ValueError(
+                        f"Bad layer trace {name} shape: {trace[name].shape}"
+                    )
 
     # Only the saved positions require oracle comparisons. The tail window
     # covers every case; the long cases also score a short decode crossing the
@@ -754,6 +792,13 @@ def main() -> None:
         client.upload_file(str(logits_path), bucket, key)
         print(f"uploaded {logits_uri}", flush=True)
         if global_rank in (6, 7):
+            trace_path = output_path.with_suffix(".layer.npz")
+            if not trace_path.exists():
+                raise RuntimeError(f"Missing layer trace for rank {global_rank}")
+            trace_uri = f"{RESULT_ROOT}/rank-{global_rank}.layer.npz"
+            bucket, key = _s3_parts(trace_uri)
+            client.upload_file(str(trace_path), bucket, key)
+            print(f"uploaded {trace_uri}", flush=True)
             audit_path = output_path.with_suffix(".layer0-moe.npz")
             if not audit_path.exists():
                 raise RuntimeError(f"Missing layer-0 MoE audit for rank {global_rank}")
