@@ -1475,6 +1475,35 @@ def test_grug_xsa_correction_and_gate_match_reference_math():
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
+def test_grug_xsa_bf16_projection_matches_rounded_fp64():
+    cfg = _tiny_hero_config()
+    attn = GrugMoeAttention(
+        cfg,
+        cache_config=None,
+        params_dtype=torch.bfloat16,
+        sliding_window=cfg.sliding_window,
+        use_rope=True,
+        qk_mult_scale=1.0,
+    )
+    with torch.no_grad():
+        attn.attn_gate.weight.zero_()
+    generator = torch.Generator().manual_seed(117)
+    attn_output = torch.randn(32, cfg.hidden_dim, generator=generator).bfloat16()
+    value_states = torch.randn(
+        32, cfg.num_kv_heads * cfg.head_dim, generator=generator
+    ).bfloat16()
+    actual = attn.apply_xsa(torch.zeros_like(attn_output), attn_output, value_states)
+
+    heads = attn_output.double().view(32, cfg.num_heads, cfg.head_dim)
+    values = value_states.double().view(32, cfg.num_kv_heads, cfg.head_dim)
+    values = values.repeat_interleave(cfg.num_heads // cfg.num_kv_heads, dim=1)
+    dot = (heads * values).sum(dim=-1, keepdim=True)
+    norm_sq = (values * values).sum(dim=-1, keepdim=True)
+    reference = (heads - dot / (norm_sq + 1e-6) * values).bfloat16().reshape_as(actual)
+
+    assert torch.count_nonzero(actual == reference) >= actual.numel() - 2
+
+
 def test_grug_moe_registry_imports():
     model_cls = ModelRegistry._try_load_model_cls("GrugMoeForCausalLM")
 

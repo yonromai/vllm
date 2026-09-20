@@ -1049,9 +1049,14 @@ class GrugMoeAttention(nn.Module):
         aligned_value = _align_kv_heads(value_heads, self.cfg.num_heads)
         attn_heads = attn_output.view(num_tokens, self.cfg.num_heads, self.head_dim)
 
+        projection_dtype = attn_heads.dtype
+        attn_heads = attn_heads.float()
+        aligned_value = aligned_value.float()
         dot = torch.sum(attn_heads * aligned_value, dim=-1, keepdim=True)
         value_norm_sq = torch.sum(aligned_value * aligned_value, dim=-1, keepdim=True)
-        attn_heads = attn_heads - (dot / (value_norm_sq + 1e-6)) * aligned_value
+        attn_heads = (attn_heads - (dot / (value_norm_sq + 1e-6)) * aligned_value).to(
+            projection_dtype
+        )
         gate = _apply_grug_linear(self.attn_gate, hidden_states)
         gate = 2 * torch.sigmoid(gate)
         attn_heads = gate[..., None].to(attn_heads.dtype) * attn_heads
