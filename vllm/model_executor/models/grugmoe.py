@@ -652,13 +652,23 @@ class GrugMoeMLP(nn.Module):
             router=moe_router,
             router_logits_dtype=torch.float32,
         )
-        self._hero_layer0_audit_path = (
-            os.environ.get("HERO_LAYER0_MOE_AUDIT_PATH")
-            if prefix.endswith("layers.0.mlp")
+        audit_layer = None
+        if prefix.endswith("layers.0.mlp"):
+            audit_layer = "LAYER0"
+        elif prefix.endswith("layers.9.mlp"):
+            audit_layer = "LAYER9"
+        self._hero_moe_audit_path = (
+            os.environ.get(f"HERO_{audit_layer}_MOE_AUDIT_PATH")
+            if audit_layer is not None
+            else None
+        )
+        self._hero_moe_audit_positions = (
+            os.environ.get(f"HERO_{audit_layer}_MOE_AUDIT_POSITIONS")
+            if audit_layer is not None
             else None
         )
 
-    def _maybe_capture_layer0_audit(
+    def _maybe_capture_moe_audit(
         self,
         positions: torch.Tensor | None,
         mlp_input: torch.Tensor,
@@ -667,17 +677,19 @@ class GrugMoeMLP(nn.Module):
         routed_output: torch.Tensor,
         expanded_output: torch.Tensor,
     ) -> None:
-        path_str = self._hero_layer0_audit_path
+        path_str = self._hero_moe_audit_path
+        positions_str = self._hero_moe_audit_positions
         arm_str = os.environ.get("HERO_LAYER0_MOE_AUDIT_ARM_PATH")
         if (
             path_str is None
+            or positions_str is None
             or arm_str is None
             or positions is None
             or not Path(arm_str).exists()
             or Path(path_str).exists()
         ):
             return
-        wanted = json.loads(os.environ["HERO_LAYER0_MOE_AUDIT_POSITIONS"])
+        wanted = json.loads(positions_str)
         matches = [
             torch.nonzero(positions == position).flatten() for position in wanted
         ]
@@ -685,7 +697,7 @@ class GrugMoeMLP(nn.Module):
             return
         selected = torch.cat(matches)
         if mlp_input.shape[0] != positions.shape[0]:
-            raise ValueError("Hero layer-0 MoE audit rows do not match positions")
+            raise ValueError("Hero MoE audit rows do not match positions")
         weights, expert_ids = self.experts.router._compute_routing(
             mlp_input[selected], router_logits[selected], torch.int32
         )
@@ -771,7 +783,7 @@ class GrugMoeMLP(nn.Module):
             router_logits=router_logits,
         )
         out = self._expand_routed_output(routed_output)
-        self._maybe_capture_layer0_audit(
+        self._maybe_capture_moe_audit(
             positions, x_flat, routed_input, router_logits, routed_output, out
         )
         return out.to(x.dtype).reshape(orig_shape)
@@ -1171,29 +1183,41 @@ class GrugMoeDecoderLayer(nn.Module):
             if cfg.is_hero and cfg.sconv and "mlp" in cfg.sconv_sites
             else None
         )
-        self._hero_layer0_boundary_audit_path = (
-            os.environ.get("HERO_LAYER0_BOUNDARY_AUDIT_PATH")
-            if prefix.endswith("layers.0")
+        audit_layer = None
+        if prefix.endswith("layers.0"):
+            audit_layer = "LAYER0"
+        elif prefix.endswith("layers.9"):
+            audit_layer = "LAYER9"
+        self._hero_boundary_audit_path = (
+            os.environ.get(f"HERO_{audit_layer}_BOUNDARY_AUDIT_PATH")
+            if audit_layer is not None
+            else None
+        )
+        self._hero_boundary_audit_positions = (
+            os.environ.get(f"HERO_{audit_layer}_MOE_AUDIT_POSITIONS")
+            if audit_layer is not None
             else None
         )
 
-    def _maybe_capture_layer0_boundary_audit(
+    def _maybe_capture_boundary_audit(
         self,
         positions: torch.Tensor,
         model_input: torch.Tensor,
         after_attn: torch.Tensor,
         mlp_input: torch.Tensor,
     ) -> None:
-        path_str = self._hero_layer0_boundary_audit_path
+        path_str = self._hero_boundary_audit_path
+        positions_str = self._hero_boundary_audit_positions
         arm_str = os.environ.get("HERO_LAYER0_MOE_AUDIT_ARM_PATH")
         if (
             path_str is None
+            or positions_str is None
             or arm_str is None
             or not Path(arm_str).exists()
             or Path(path_str).exists()
         ):
             return
-        wanted = json.loads(os.environ["HERO_LAYER0_MOE_AUDIT_POSITIONS"])
+        wanted = json.loads(positions_str)
         matches = [
             torch.nonzero(positions == position).flatten() for position in wanted
         ]
@@ -1204,7 +1228,7 @@ class GrugMoeDecoderLayer(nn.Module):
             value.shape[0] != positions.shape[0]
             for value in (model_input, after_attn, mlp_input)
         ):
-            raise ValueError("Hero layer-0 boundary audit rows do not match positions")
+            raise ValueError("Hero boundary audit rows do not match positions")
         np.savez_compressed(
             path_str,
             positions=np.asarray(wanted, dtype=np.int32),
@@ -1226,7 +1250,7 @@ class GrugMoeDecoderLayer(nn.Module):
         hidden_states = hidden_states + attn_out
 
         mlp_in = self.mlp_gated_norm(self.post_attention_layernorm(hidden_states))
-        self._maybe_capture_layer0_boundary_audit(
+        self._maybe_capture_boundary_audit(
             positions, model_input, hidden_states, mlp_in
         )
         mlp_out = self.mlp(mlp_in, positions=positions)
