@@ -446,6 +446,7 @@ def _run_rank(
         enforce_eager=True,
         enable_prefix_caching=False,
         enable_trace_replay=True,
+        enable_return_routed_experts=True,
         max_logprobs=TOP_LOGPROBS,
         max_num_seqs=1,
         max_num_batched_tokens=4097,
@@ -473,6 +474,20 @@ def _run_rank(
         rank=global_rank,
         prediction_indices=early_indices,
     )
+    short_routes = short_output.outputs[0].routed_experts
+    # Native arrays are [layer, case, position, expert], while vLLM returns
+    # [position, layer, expert].
+    expected_short_shape = (
+        len(short_tokens),
+        arrays["route_expert_ids"].shape[0],
+        arrays["route_expert_ids"].shape[-1],
+    )
+    if short_routes is None or short_routes.shape != expected_short_shape:
+        raise RuntimeError(
+            "Short routed-expert capture has shape "
+            f"{None if short_routes is None else short_routes.shape}; "
+            f"expected {expected_short_shape}"
+        )
     if layer0_audit_arm is not None:
         layer0_audit_arm.touch()
 
@@ -494,6 +509,23 @@ def _run_rank(
         arrays=arrays,
         rank=global_rank,
         prediction_indices=prediction_indices,
+    )
+    prefill_routes = prefill_output.outputs[0].routed_experts
+    expected_prefill_shape = (
+        valid_length,
+        arrays["route_expert_ids"].shape[0],
+        arrays["route_expert_ids"].shape[-1],
+    )
+    if prefill_routes is None or prefill_routes.shape != expected_prefill_shape:
+        raise RuntimeError(
+            "Prefill routed-expert capture has shape "
+            f"{None if prefill_routes is None else prefill_routes.shape}; "
+            f"expected {expected_prefill_shape}"
+        )
+    np.savez_compressed(
+        Path(output_path).with_suffix(".prefill-routes.npz"),
+        short=short_routes,
+        prefill=prefill_routes,
     )
     if global_rank in (6, 7):
         trace_path = Path(output_path).with_suffix(".layer.npz")
@@ -633,6 +665,7 @@ def _run_rank(
             "all2all_backend": "allgather_reducescatter",
             "batch_invariant": os.environ["VLLM_BATCH_INVARIANT"] == "1",
             "layer0_moe_audit": global_rank in (6, 7),
+            "return_routed_experts": True,
             "short_prefix_route_audit_layers": [2, 12, 38]
             if global_rank in (6, 7)
             else [],
@@ -809,6 +842,13 @@ def main() -> None:
         bucket, key = _s3_parts(logits_uri)
         client.upload_file(str(logits_path), bucket, key)
         print(f"uploaded {logits_uri}", flush=True)
+        routes_path = output_path.with_suffix(".prefill-routes.npz")
+        if not routes_path.exists():
+            raise RuntimeError(f"Missing routed-expert capture for rank {global_rank}")
+        routes_uri = f"{RESULT_ROOT}/rank-{global_rank}.prefill-routes.npz"
+        bucket, key = _s3_parts(routes_uri)
+        client.upload_file(str(routes_path), bucket, key)
+        print(f"uploaded {routes_uri}", flush=True)
         if global_rank in (6, 7):
             trace_path = output_path.with_suffix(".layer.npz")
             if not trace_path.exists():
