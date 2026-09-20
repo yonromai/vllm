@@ -290,6 +290,8 @@ def test_grug_model_returns_requested_eagle3_auxiliary_states():
     model.norm = nn.Identity()
     model.final_gated_norm = nn.Identity()
     model._set_aux_hidden_state_layers((0, 2))
+    model._layer_probe_path = None
+    model._layer_probe_written = False
     input_ids = torch.tensor([1, 3])
 
     final_hidden_state, auxiliary_states = model.forward(input_ids, torch.arange(2))
