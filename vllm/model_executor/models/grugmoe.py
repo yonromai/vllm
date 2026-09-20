@@ -655,8 +655,12 @@ class GrugMoeMLP(nn.Module):
         audit_layer = None
         if prefix.endswith("layers.0.mlp"):
             audit_layer = "LAYER0"
+        elif prefix.endswith("layers.2.mlp"):
+            audit_layer = "LAYER2"
         elif prefix.endswith("layers.9.mlp"):
             audit_layer = "LAYER9"
+        elif prefix.endswith("layers.12.mlp"):
+            audit_layer = "LAYER12"
         elif prefix.endswith("layers.38.mlp"):
             audit_layer = "LAYER38"
         self._hero_moe_audit_path = (
@@ -1193,8 +1197,12 @@ class GrugMoeDecoderLayer(nn.Module):
         audit_layer = None
         if prefix.endswith("layers.0"):
             audit_layer = "LAYER0"
+        elif prefix.endswith("layers.2"):
+            audit_layer = "LAYER2"
         elif prefix.endswith("layers.9"):
             audit_layer = "LAYER9"
+        elif prefix.endswith("layers.12"):
+            audit_layer = "LAYER12"
         elif prefix.endswith("layers.38"):
             audit_layer = "LAYER38"
         self._hero_boundary_audit_path = (

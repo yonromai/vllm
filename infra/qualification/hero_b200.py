@@ -343,8 +343,12 @@ def _run_rank(
     if global_rank in (6, 7):
         layer0_audit_path = Path(output_path).with_suffix(".layer0-moe.npz")
         layer0_boundary_path = Path(output_path).with_suffix(".layer0-boundary.npz")
+        layer2_audit_path = Path(output_path).with_suffix(".layer2-moe.npz")
+        layer2_boundary_path = Path(output_path).with_suffix(".layer2-boundary.npz")
         layer9_audit_path = Path(output_path).with_suffix(".layer9-moe.npz")
         layer9_boundary_path = Path(output_path).with_suffix(".layer9-boundary.npz")
+        layer12_audit_path = Path(output_path).with_suffix(".layer12-moe.npz")
+        layer12_boundary_path = Path(output_path).with_suffix(".layer12-boundary.npz")
         layer38_audit_path = Path(output_path).with_suffix(".layer38-moe.npz")
         layer38_boundary_path = Path(output_path).with_suffix(".layer38-boundary.npz")
         layer0_audit_arm = Path(output_path).with_suffix(".layer0-moe.armed")
@@ -354,9 +358,15 @@ def _run_rank(
                 "HERO_LAYER0_BOUNDARY_AUDIT_PATH": str(layer0_boundary_path),
                 "HERO_LAYER0_MOE_AUDIT_ARM_PATH": str(layer0_audit_arm),
                 "HERO_LAYER0_MOE_AUDIT_POSITIONS": json.dumps([2046, 2047, 2048]),
+                "HERO_LAYER2_MOE_AUDIT_PATH": str(layer2_audit_path),
+                "HERO_LAYER2_BOUNDARY_AUDIT_PATH": str(layer2_boundary_path),
+                "HERO_LAYER2_MOE_AUDIT_POSITIONS": json.dumps([6]),
                 "HERO_LAYER9_MOE_AUDIT_PATH": str(layer9_audit_path),
                 "HERO_LAYER9_BOUNDARY_AUDIT_PATH": str(layer9_boundary_path),
                 "HERO_LAYER9_MOE_AUDIT_POSITIONS": json.dumps([0]),
+                "HERO_LAYER12_MOE_AUDIT_PATH": str(layer12_audit_path),
+                "HERO_LAYER12_BOUNDARY_AUDIT_PATH": str(layer12_boundary_path),
+                "HERO_LAYER12_MOE_AUDIT_POSITIONS": json.dumps([6]),
                 "HERO_LAYER38_MOE_AUDIT_PATH": str(layer38_audit_path),
                 "HERO_LAYER38_BOUNDARY_AUDIT_PATH": str(layer38_boundary_path),
                 "HERO_LAYER38_MOE_AUDIT_POSITIONS": json.dumps([6]),
@@ -623,6 +633,9 @@ def _run_rank(
             "all2all_backend": "allgather_reducescatter",
             "batch_invariant": os.environ["VLLM_BATCH_INVARIANT"] == "1",
             "layer0_moe_audit": global_rank in (6, 7),
+            "short_prefix_route_audit_layers": [2, 12, 38]
+            if global_rank in (6, 7)
+            else [],
             "attention_backend": "FLASH_ATTN",
             "flash_attn_version": 2,
             "enforce_eager": True,
@@ -830,7 +843,7 @@ def main() -> None:
             bucket, key = _s3_parts(boundary_uri)
             client.upload_file(str(boundary_path), bucket, key)
             print(f"uploaded {boundary_uri}", flush=True)
-            for layer, positions in ((9, [0]), (38, [6])):
+            for layer, positions in ((2, [6]), (9, [0]), (12, [6]), (38, [6])):
                 for kind in ("moe", "boundary"):
                     audit_path = output_path.with_suffix(f".layer{layer}-{kind}.npz")
                     if not audit_path.exists():
