@@ -46,6 +46,8 @@ RESULT_ROOT = os.environ.get(
 )
 VLLM_REVISION = "9d1ccba766fc7cf7cda4a54ac826203052ccabd8"
 WORLD_SIZE = 8
+LAYER_PROBE_RANKS = (6, 7)
+LAYER_PROBE_POSITIONS = (0, 1, 2, 3, 4, 5, 6, 7, 2046, 2047, 2048, 2049, 4094, 4095)
 LOCAL_WORLD_SIZE = 4
 MASTER_PORT = 43860
 SIOCGIFADDR = 0x8915
@@ -379,6 +381,16 @@ def _run_rank(
     os.environ["HERO_DECODE_CAPTURE_ARM_PATH"] = str(decode_capture_arm)
     decode_capture_arm.unlink(missing_ok=True)
     tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
+    if global_rank in LAYER_PROBE_RANKS:
+        os.environ.update(
+            {
+                "HERO_LAYER_PROBE_PATH": str(
+                    Path(output_path).with_suffix(".layer.npz")
+                ),
+                "HERO_LAYER_PROBE_LENGTH": str(valid_length),
+                "HERO_LAYER_PROBE_PREFIX": ",".join(str(token) for token in tokens[:8]),
+            }
+        )
 
     llm = LLM(
         model=config_dir,
@@ -447,6 +459,41 @@ def _run_rank(
         rank=global_rank,
         prediction_indices=prediction_indices,
     )
+    if global_rank in LAYER_PROBE_RANKS:
+        trace_path = Path(output_path).with_suffix(".layer.npz")
+        if not trace_path.exists():
+            raise ValueError(f"No layer-boundary trace for case {global_rank}")
+        model_config = json.loads((Path(config_dir) / "config.json").read_text())
+        hidden_dim = int(model_config["hidden_size"])
+        layer_count = int(model_config["num_hidden_layers"])
+        with np.load(trace_path, allow_pickle=False) as trace:
+            expected_positions = np.asarray(
+                [
+                    position
+                    for position in LAYER_PROBE_POSITIONS
+                    if position < valid_length
+                ],
+                dtype=np.int32,
+            )
+            if not np.array_equal(trace["positions"], expected_positions):
+                raise ValueError(
+                    f"Layer-boundary positions differ for case {global_rank}"
+                )
+            expected_tokens = np.asarray(tokens)[expected_positions]
+            if not np.array_equal(trace["token_ids"], expected_tokens):
+                raise ValueError(
+                    f"Layer-boundary token IDs differ for case {global_rank}"
+                )
+            expected_names = ["model_input"] + [
+                f"layer_{layer_index}_{site}"
+                for layer_index in range(layer_count)
+                for site in ("after_attn", "after_block")
+            ]
+            for name in expected_names:
+                if trace[name].shape != (len(expected_positions), hidden_dim):
+                    raise ValueError(
+                        f"Layer trace {name} has shape {trace[name].shape}"
+                    )
 
     # Only the saved positions require oracle comparisons. The tail window
     # covers every case; the long cases also score a short decode crossing the
@@ -528,6 +575,11 @@ def _run_rank(
 
     result = {
         "case_index": global_rank,
+        "layer_probe_uri": (
+            f"{RESULT_ROOT}/rank-{global_rank}.layer.npz"
+            if global_rank in LAYER_PROBE_RANKS
+            else None
+        ),
         "valid_length": valid_length,
         "checkpoint": CHECKPOINT,
         "golden_root": GOLDEN_ROOT,
@@ -707,6 +759,12 @@ def main() -> None:
                 print(f"uploaded failure log {log_uri}", flush=True)
         raise RuntimeError(f"Qualification ranks failed: {failures}")
     for global_rank, output_path, _ in processes:
+        if global_rank in LAYER_PROBE_RANKS:
+            trace_path = output_path.with_suffix(".layer.npz")
+            trace_uri = f"{RESULT_ROOT}/rank-{global_rank}.layer.npz"
+            bucket, key = _s3_parts(trace_uri)
+            client.upload_file(str(trace_path), bucket, key)
+            print(f"uploaded {trace_uri}", flush=True)
         result_uri = f"{RESULT_ROOT}/rank-{global_rank}.json"
         _put_json(client, result_uri, json.loads(output_path.read_text()))
         print(f"uploaded {result_uri}", flush=True)
