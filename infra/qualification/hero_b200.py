@@ -429,9 +429,11 @@ def _run_rank(
         prediction_indices=early_indices,
     )
     short_routes = short_output.outputs[0].routed_experts
+    # Native arrays are [layer, case, position, expert], while vLLM returns
+    # [position, layer, expert].
     expected_short_shape = (
         len(short_tokens),
-        arrays["route_expert_ids"].shape[1],
+        arrays["route_expert_ids"].shape[0],
         arrays["route_expert_ids"].shape[-1],
     )
     if short_routes is None or short_routes.shape != expected_short_shape:
@@ -463,7 +465,7 @@ def _run_rank(
     prefill_routes = prefill_output.outputs[0].routed_experts
     expected_prefill_shape = (
         valid_length,
-        arrays["route_expert_ids"].shape[1],
+        arrays["route_expert_ids"].shape[0],
         arrays["route_expert_ids"].shape[-1],
     )
     if prefill_routes is None or prefill_routes.shape != expected_prefill_shape:
