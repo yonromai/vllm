@@ -478,6 +478,11 @@ def _run_rank(
                 "HERO_EMBED_HISTORY_PREFIX_LENGTH": str(valid_length - 32),
                 "HERO_EMBED_HISTORY_TARGET": str(DECODE_LAYER_PROBE_POSITION),
                 "HERO_EMBED_HISTORY_PREFIX_TOKENS": json.dumps(tokens[:8]),
+                # One preselected full-prefill value is replaced by its
+                # independently FP64-rounded cached-decode counterpart.
+                "HERO_EMBED_HISTORY_FORCE_DOWN": json.dumps(
+                    [2028, 120, -2.265625, -2.28125]
+                ),
             }
         )
     if global_rank == DECODE_LAYER_PROBE_RANK:

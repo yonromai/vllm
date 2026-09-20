@@ -421,6 +421,7 @@ def test_grug_model_embedding_history_records_full_and_cached_paths(tmp_path: Pa
     model._embed_history_target = 11
     model._embed_history_prefix = (1, 3, 0, 2, 1, 3, 0, 2)
     model._embed_history_written = set()
+    model._embed_history_force_down = None
     with torch.no_grad():
         model.embed_gated_norm.down_proj.weight.fill_(0.125)
         model.embed_gated_norm.up_proj.weight.fill_(0.125)
@@ -437,6 +438,22 @@ def test_grug_model_embedding_history_records_full_and_cached_paths(tmp_path: Pa
             .detach()
             .numpy(),
         )
+        original_down = full["embed_gate_down"].copy()
+
+    model._embed_history_written.clear()
+    original = float(original_down[11, 0])
+    replacement = original + 0.125
+    model._embed_history_force_down = (11, 0, original, replacement)
+    forced_output = model.forward(ids, torch.arange(12))
+    forced_down = torch.from_numpy(original_down.copy())
+    forced_down[11, 0] = replacement
+    expected_forced = model.embed_tokens(ids) * torch.sigmoid(
+        F.linear(F.silu(forced_down), model.embed_gated_norm.up_proj.weight)
+    )
+    torch.testing.assert_close(forced_output, expected_forced, atol=0, rtol=0)
+    with np.load(tmp_path / "history/full.npz") as forced:
+        np.testing.assert_array_equal(forced["embed_gate_down"], forced_down.numpy())
+    model._embed_history_force_down = None
 
     model._embed_history_arm_path.touch()
     prefix_output = model.forward(ids[:10], torch.arange(10))

@@ -492,6 +492,7 @@ class GrugMoeGatedNorm(nn.Module):
         self,
         x: torch.Tensor,
         capture: tuple[torch.Tensor, dict[str, torch.Tensor]] | None = None,
+        force_down: tuple[int, int, float, float] | None = None,
     ) -> torch.Tensor:
         dtype = x.dtype
         if self.down_accumulation_dtype is None:
@@ -501,6 +502,17 @@ class GrugMoeGatedNorm(nn.Module):
                 x.to(self.down_accumulation_dtype),
                 self.down_proj.weight.to(self.down_accumulation_dtype),
             ).to(dtype)
+        if force_down is not None:
+            position, coordinate, expected, replacement = force_down
+            if (
+                gate_hidden.ndim != 2
+                or position >= gate_hidden.shape[0]
+                or coordinate >= gate_hidden.shape[1]
+                or float(gate_hidden[position, coordinate].item()) != expected
+            ):
+                raise ValueError("Hero embedding counterfactual input changed")
+            gate_hidden = gate_hidden.clone()
+            gate_hidden[position, coordinate] = replacement
         if capture is not None:
             indices, tensors = capture
             tensors["gate_down"] = gate_hidden.index_select(0, indices)
@@ -1459,6 +1471,17 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             json.loads(os.environ.get("HERO_EMBED_HISTORY_PREFIX_TOKENS", "[]"))
         )
         self._embed_history_written: set[str] = set()
+        forced_down = os.environ.get("HERO_EMBED_HISTORY_FORCE_DOWN")
+        if forced_down is None:
+            self._embed_history_force_down = None
+        else:
+            values = json.loads(forced_down)
+            self._embed_history_force_down = (
+                int(values[0]),
+                int(values[1]),
+                float(values[2]),
+                float(values[3]),
+            )
         if self._layer_probe_path is not None and (
             self._layer_probe_length <= 0
             or len(self._layer_probe_prefix) != 8
@@ -1627,7 +1650,13 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                     0, probe_indices
                 )
                 hidden_states = self.embed_gated_norm(
-                    hidden_states, capture=(probe_indices, embedding_probe)
+                    hidden_states,
+                    capture=(probe_indices, embedding_probe),
+                    force_down=(
+                        self._embed_history_force_down
+                        if history_label == "full"
+                        else None
+                    ),
                 )
             else:
                 hidden_states = self.embed_gated_norm(hidden_states)

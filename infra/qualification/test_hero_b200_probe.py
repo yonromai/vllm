@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import numpy as np
-
 from hero_b200 import _collect_embedding_history
 
 
