@@ -816,8 +816,10 @@ def test_grug_moe_tpu_accepts_only_unquantized_backend(
     [
         ("cpu", torch.float32, None),
         ("cpu", torch.float32, torch.float32),
+        ("cpu", torch.float32, torch.float64),
         ("cuda", torch.bfloat16, None),
         ("cuda", torch.bfloat16, torch.float32),
+        ("cuda", torch.bfloat16, torch.float64),
     ],
 )
 def test_grug_gated_norm_matches_reference_math(

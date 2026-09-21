@@ -466,7 +466,7 @@ class GrugMoeGatedNorm(nn.Module):
         super().__init__()
         if down_accumulation_dtype is not None and quant_config is not None:
             raise ValueError(
-                "FP32 gated-norm down projection requires unquantized weights"
+                "High-precision gated-norm down projection requires unquantized weights"
             )
         self.down_accumulation_dtype = down_accumulation_dtype
         self.down_proj = ReplicatedLinear(
@@ -1377,9 +1377,9 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
                 self.params_dtype,
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.embed_gated_norm",
-                # A 4K GPU BF16 GEMM can cross a down-logit BF16 midpoint.
+                # FP32 prefill and decode GEMMs can round the same BF16 dot differently.
                 down_accumulation_dtype=(
-                    torch.float32
+                    torch.float64
                     if self.params_dtype == torch.bfloat16
                     and self.quant_config is None
                     and current_platform.is_cuda()
