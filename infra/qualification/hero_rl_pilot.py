@@ -48,6 +48,9 @@ GSM8K_INPUT_URI = (
 GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
 CONTEXT_LIMIT = 4096
 MAX_MODEL_LEN = CONTEXT_LIMIT + 1
+# The pinned Marin tokenizer maps <|eot_id|> to 128009, but EOS to 128001.
+# Hero commonly ends an assistant turn with EOT; EOS alone did not stop GSM8K.
+HERO_TURN_END_TOKEN_ID = 128009
 # Bound startup profiling and the full-prefix EP all-gather workspace on H100.
 MAX_BATCHED_TOKENS = 1024
 HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
@@ -72,7 +75,7 @@ MODE_NAME = (
     if PILOT == "1"
     else "rl-64"
     if RL_ROLLOUT == "1"
-    else "native-4k-gsm8k"
+    else "eot-4k-gsm8k"
 )
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
@@ -664,6 +667,7 @@ def _run_rank(
                 logprobs=5,
                 detokenize=False,
                 seed=17 + global_rank,
+                stop_token_ids=[HERO_TURN_END_TOKEN_ID],
             ),
             use_tqdm=False,
         )[0]
@@ -704,6 +708,7 @@ def _run_rank(
                 "max_tokens": response_budget,
                 "total_context_limit": CONTEXT_LIMIT,
                 "seed": 17 + global_rank,
+                "stop_token_ids": [HERO_TURN_END_TOKEN_ID],
             },
         }
         # A replay failure can kill an EP engine. Retain the natural response
@@ -947,6 +952,9 @@ def main() -> None:
         ],
         "export_manifest_sha256": _sha256(export_manifest_path),
         "export_config_sha256": _sha256(config_dir / "config.json"),
+        "export_eos_token_id": json.loads(
+            (config_dir / "config.json").read_text()
+        ).get("eos_token_id"),
         "export_source_revision": export_manifest["source_revision"],
         "pending_qb_rule": export_manifest["pending_qb_rule"],
         "pending_qb_betas_sha256": export_manifest["pending_qb_betas_sha256"],
@@ -1125,7 +1133,7 @@ def submit(iris_config: Path) -> None:
             max_retries_failure=0,
             max_retries_preemption=0,
             max_task_failures=0,
-            priority_band=priority_band_value("production"),
+            priority_band=priority_band_value("interactive"),
             existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
         )
     print(job.job_id)
