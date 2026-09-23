@@ -746,6 +746,52 @@ def _run_rank(
             use_tqdm=False,
         )[0]
         prefill_replay_seconds = time.monotonic() - prefill_start
+        full_prefill_entries = prefill_replay.prompt_logprobs[
+            len(prompt_ids) : len(trajectory_ids)
+        ]
+        if len(full_prefill_entries) != len(response_ids):
+            raise ValueError("GSM8K full-prefix prefill logprobs are incomplete")
+        full_prefill_scores = [
+            float(entries[token_id].logprob)
+            for entries, token_id in zip(
+                full_prefill_entries, response_ids, strict=True
+            )
+        ]
+        full_prefill_top_ids = [
+            _top_by_rank(entries, count=1)[0] for entries in full_prefill_entries
+        ]
+        sampled_top_ids = [
+            _top_by_rank(entries, count=1)[0] for entries in completion.logprobs
+        ]
+        full_prefill_routes = prefill_replay.outputs[0].routed_experts
+        route_comparison = {
+            "sampled_shape": list(routes.shape),
+            "prefill_shape": (
+                None if full_prefill_routes is None else list(full_prefill_routes.shape)
+            ),
+        }
+        if (
+            full_prefill_routes is not None
+            and full_prefill_routes.shape[0] >= routes.shape[0]
+        ):
+            comparable = full_prefill_routes[: routes.shape[0]]
+            ordered_different = np.any(comparable != routes, axis=-1)
+            set_different = np.any(
+                np.sort(comparable, axis=-1) != np.sort(routes, axis=-1), axis=-1
+            )
+            response_rows = slice(len(prompt_ids) - 1, None)
+            route_comparison.update(
+                ordered_mismatch_rows=int(np.any(ordered_different, axis=-1).sum()),
+                set_mismatch_rows=int(np.any(set_different, axis=-1).sum()),
+                ordered_mismatch_response_rows=int(
+                    np.any(ordered_different[response_rows], axis=-1).sum()
+                ),
+                set_mismatch_response_rows=int(
+                    np.any(set_different[response_rows], axis=-1).sum()
+                ),
+                compared_rows=int(routes.shape[0]),
+                compared_response_rows=len(response_ids),
+            )
         prefill_entries = [
             prefill_replay.prompt_logprobs[len(prompt_ids) + index]
             for index in replay_positions
@@ -793,6 +839,15 @@ def _run_rank(
                 "cached_replay_seconds": cached_replay_seconds,
                 "prefill_response_indices": replay_positions,
                 "prefill_target_logprobs": prefill_scores,
+                "full_prefill_target_logprobs": full_prefill_scores,
+                "full_prefill_top1_mismatch_indices": [
+                    index
+                    for index, (sampled_top, prefill_top) in enumerate(
+                        zip(sampled_top_ids, full_prefill_top_ids, strict=True)
+                    )
+                    if sampled_top != prefill_top
+                ],
+                "full_prefill_route_comparison": route_comparison,
                 "sampled_top_token_ids": [
                     _top_by_rank(completion.logprobs[index], count=1)[0]
                     for index in replay_positions
