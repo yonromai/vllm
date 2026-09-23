@@ -48,8 +48,8 @@ GSM8K_INPUT_URI = (
 GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
 CONTEXT_LIMIT = 4096
 MAX_MODEL_LEN = CONTEXT_LIMIT + 1
-# Bound vLLM's startup dummy run and MoE workspace on 80 GiB H100s.
-MAX_BATCHED_TOKENS = 2048
+# Bound startup profiling and the full-prefix EP all-gather workspace on H100.
+MAX_BATCHED_TOKENS = 1024
 HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
 if HARDWARE not in {"GB200", "H100"}:
     raise ValueError(f"Unsupported Hero pilot hardware {HARDWARE!r}")
@@ -685,6 +685,43 @@ def _run_rank(
             raise ValueError(f"GSM8K route shape {observed_shape} != {expected_shape}")
         route_path = Path(output_path).with_suffix(".gsm8k.routes.npz")
         np.savez_compressed(route_path, routed_experts=routes.astype(np.int16))
+        gsm8k_capture = {
+            "row_id": record["row_id"],
+            "ground_truth": record["ground_truth"],
+            "prompt_token_ids": prompt_ids,
+            "response_token_ids": response_ids,
+            "response_text": completion.text,
+            "response_logprobs": response_scores,
+            "finish_reason": completion.finish_reason,
+            "stop_reason": completion.stop_reason,
+            "elapsed_seconds": duration,
+            "routed_experts_shape": list(routes.shape),
+            "routed_experts_sha256": _sha256(route_path),
+            "routed_experts_uri": f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz",
+            "sampling": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_tokens": response_budget,
+                "total_context_limit": CONTEXT_LIMIT,
+                "seed": 17 + global_rank,
+            },
+        }
+        # A replay failure can kill an EP engine. Retain the natural response
+        # before the optional same-prefix diagnostic starts.
+        Path(output_path).with_suffix(".gsm8k.partial.json").write_text(
+            json.dumps(
+                {
+                    "checkpoint": CHECKPOINT,
+                    "weight_root": WEIGHT_ROOT,
+                    "vllm_revision": VLLM_REVISION,
+                    "qualification_revision": os.environ["HERO_QUALIFICATION_REVISION"],
+                    "input_evidence": input_evidence,
+                    "global_rank": global_rank,
+                    "gsm8k_pilot": gsm8k_capture,
+                },
+                sort_keys=True,
+            ) + "\n"
+        )
 
         trajectory_ids = prompt_ids + response_ids
         replay_positions = sorted(
@@ -745,15 +782,7 @@ def _run_rank(
         ]
         cached_response_start = decode_start_index - len(prompt_ids)
         gsm8k_pilot = {
-            "row_id": record["row_id"],
-            "ground_truth": record["ground_truth"],
-            "prompt_token_ids": prompt_ids,
-            "response_token_ids": response_ids,
-            "response_text": completion.text,
-            "response_logprobs": response_scores,
-            "finish_reason": completion.finish_reason,
-            "stop_reason": completion.stop_reason,
-            "elapsed_seconds": duration,
+            **gsm8k_capture,
             "same_prefix": {
                 "prefill_replay_seconds": prefill_replay_seconds,
                 "cached_replay_seconds": cached_replay_seconds,
@@ -767,16 +796,6 @@ def _run_rank(
                 "cached_response_start_index": cached_response_start,
                 "cached_target_logprobs": cached_scores,
                 "cached_top_token_ids": cached_top_ids,
-            },
-            "routed_experts_shape": list(routes.shape),
-            "routed_experts_sha256": _sha256(route_path),
-            "routed_experts_uri": f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz",
-            "sampling": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "max_tokens": response_budget,
-                "total_context_limit": CONTEXT_LIMIT,
-                "seed": 17 + global_rank,
             },
         }
 
@@ -994,6 +1013,14 @@ def main() -> None:
         time.sleep(2)
     if failures:
         for global_rank, output_path, process in processes:
+            if GSM8K_PILOT == "1":
+                for suffix in (".gsm8k.partial.json", ".gsm8k.routes.npz"):
+                    partial_path = output_path.with_suffix(suffix)
+                    if partial_path.exists():
+                        partial_uri = f"{RESULT_ROOT}/rank-{global_rank}{suffix}"
+                        bucket, key = _s3_parts(partial_uri)
+                        client.upload_file(str(partial_path), bucket, key)
+                        print(f"uploaded partial {partial_uri}", flush=True)
             if process.exitcode in (None, 0):
                 continue
             log_path = output_path.with_suffix(".log")
