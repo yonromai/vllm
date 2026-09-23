@@ -22,9 +22,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import boto3
 import numpy as np
-from botocore.config import Config
 
 CHECKPOINT = (
     "s3://marin-us-east-02a/marin/grug/hero-ragged_a2a-nccl2307-ep-step81k/"
@@ -86,6 +84,9 @@ def _s3_parts(uri: str) -> tuple[str, str]:
 
 
 def _s3_client():
+    import boto3
+    from botocore.config import Config
+
     return boto3.client(
         "s3",
         endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
