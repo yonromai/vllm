@@ -42,6 +42,9 @@ if HARDWARE not in {"GB200", "H100"}:
 PILOT = os.environ.get("HERO_PILOT", "1")
 if PILOT not in {"0", "1"}:
     raise ValueError(f"HERO_PILOT must be 0 or 1, got {PILOT!r}")
+GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
+if not 0 < GPU_MEMORY_UTILIZATION < 1:
+    raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-rl/"
@@ -378,7 +381,7 @@ def _run_rank(
         max_logprobs=TOP_LOGPROBS,
         max_num_seqs=1,
         max_num_batched_tokens=4097,
-        gpu_memory_utilization=0.95,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         disable_custom_all_reduce=True,
     )
 
@@ -413,6 +416,8 @@ def _run_rank(
                     "checkpoint": CHECKPOINT,
                     "weight_root": WEIGHT_ROOT,
                     "vllm_revision": VLLM_REVISION,
+                    "qualification_revision": os.environ["HERO_QUALIFICATION_REVISION"],
+                    "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
                     "input_evidence": input_evidence,
                     "rank": global_rank,
                     "case_index": case_index,
@@ -589,6 +594,7 @@ def _run_rank(
             "load_format": "runai_streamer",
             "runai_distributed": True,
             "runai_memory_limit": 2 * 1024**3,
+            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
             "top_logprobs_returned": TOP_LOGPROBS,
         },
         "tolerances_fixed_before_run": {
@@ -784,6 +790,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_PILOT": PILOT,
                     "HERO_HARDWARE": HARDWARE,
                     "HERO_RESULT_ROOT": RESULT_ROOT,
+                    "HERO_GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
                     "PYTHONUNBUFFERED": "1",
                 },
                 setup_scripts=[QUALIFICATION_SETUP],
