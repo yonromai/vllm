@@ -62,7 +62,11 @@ RESULT_ROOT = os.environ.get(
 VLLM_REVISION = "5a4a52329468b6bd16b21d1f319fcb96d405dd36"
 WORLD_SIZE = 32 if HARDWARE == "H100" else 8
 LOCAL_WORLD_SIZE = 8 if HARDWARE == "H100" else 4
-MASTER_PORT = 29555
+# Host-network tasks can share a node with other jobs. Derive a stable port
+# from this run's output root so their vLLM DP listeners do not collide.
+MASTER_PORT = 20000 + (
+    int(hashlib.sha256(RESULT_ROOT.encode()).hexdigest()[:4], 16) % 20000
+)
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
 QUALIFICATION_GPUS_PER_TASK = LOCAL_WORLD_SIZE
