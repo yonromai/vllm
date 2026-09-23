@@ -30,12 +30,9 @@ CHECKPOINT = (
 )
 GOLDEN_ROOT = (
     "s3://marin-us-east-02a/marin/reference/hero-forward/"
-    "hero-535b-step108000-bf16-8k-diagnostic-v1-5a7dffedea5c"
-)
-EXPORT_GOLDEN_ROOT = (
-    "s3://marin-us-east-02a/marin/reference/hero-forward/"
     "hero-535b-step108000-bf16-v1-dcfe4ced165a"
 )
+EXPORT_GOLDEN_ROOT = GOLDEN_ROOT
 FRESH_INPUT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-numerical-resolution/"
     "fp32-combine/hero-535b-step108000-bf16-fp32-combine-fresh-v1-123ec116ea42"
@@ -49,9 +46,9 @@ GSM8K_INPUT_URI = (
     "inputs/train-0-31-v1.json"
 )
 GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
-MAX_MODEL_LEN = 8193
-# Bound vLLM's startup dummy run and MoE workspace on 80 GiB H100s. The
-# 8192-token prefill is scheduled in chunks; its scored positions stay intact.
+CONTEXT_LIMIT = 4096
+MAX_MODEL_LEN = CONTEXT_LIMIT + 1
+# Bound vLLM's startup dummy run and MoE workspace on 80 GiB H100s.
 MAX_BATCHED_TOKENS = 2048
 HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
 if HARDWARE not in {"GB200", "H100"}:
@@ -75,7 +72,7 @@ MODE_NAME = (
     if PILOT == "1"
     else "rl-64"
     if RL_ROLLOUT == "1"
-    else "native-8k-gsm8k"
+    else "native-4k-gsm8k"
 )
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
@@ -593,8 +590,6 @@ def _run_rank(
     windows = [(max(1, valid_length - 32), valid_length)]
     if valid_length >= 4095:
         windows.append((2040, 2052))
-    if valid_length >= 8192:
-        windows.append((4088, 4100))
     # Queue all windows together: offline DP/EP must keep every rank in the
     # same engine wave until all ranks have completed their collective steps.
     decode_outputs = llm.generate(
@@ -656,15 +651,18 @@ def _run_rank(
         pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
         record = pilot_inputs["records"][global_rank]
         prompt_ids = record["hero_prompt_token_ids"]
+        response_budget = CONTEXT_LIMIT - len(prompt_ids)
+        if response_budget <= 0:
+            raise ValueError(f"GSM8K prompt {global_rank} exceeds the context limit")
         start = time.monotonic()
         rollout = llm.generate(
             [{"prompt_token_ids": prompt_ids}],
             SamplingParams(
-                max_tokens=256,
+                max_tokens=response_budget,
                 temperature=1.0,
                 top_p=1.0,
                 logprobs=5,
-                detokenize=True,
+                detokenize=False,
                 seed=17 + global_rank,
             ),
             use_tqdm=False,
@@ -672,6 +670,14 @@ def _run_rank(
         duration = time.monotonic() - start
         completion = rollout.outputs[0]
         response_ids = [int(token_id) for token_id in completion.token_ids]
+        if not response_ids:
+            raise ValueError(f"GSM8K rank {global_rank} returned no response tokens")
+        response_scores = [
+            float(logprobs[token_id].logprob)
+            for token_id, logprobs in zip(
+                response_ids, completion.logprobs, strict=True
+            )
+        ]
         routes = completion.routed_experts
         expected_shape = (len(prompt_ids) + len(response_ids) - 1, 48, 8)
         if routes is None or routes.shape != expected_shape:
@@ -679,28 +685,97 @@ def _run_rank(
             raise ValueError(f"GSM8K route shape {observed_shape} != {expected_shape}")
         route_path = Path(output_path).with_suffix(".gsm8k.routes.npz")
         np.savez_compressed(route_path, routed_experts=routes.astype(np.int16))
+
+        trajectory_ids = prompt_ids + response_ids
+        replay_positions = sorted(
+            {0, min(1, len(response_ids) - 1), len(response_ids) // 2}
+            | set(range(max(0, len(response_ids) - 32), len(response_ids)))
+        )
+        prefill_start = time.monotonic()
+        prefill_replay = llm.generate(
+            [{"prompt_token_ids": trajectory_ids}],
+            SamplingParams(
+                max_tokens=1,
+                temperature=0,
+                prompt_logprobs=1,
+                detokenize=False,
+                ignore_eos=True,
+            ),
+            use_tqdm=False,
+        )[0]
+        prefill_replay_seconds = time.monotonic() - prefill_start
+        prefill_entries = [
+            prefill_replay.prompt_logprobs[len(prompt_ids) + index]
+            for index in replay_positions
+        ]
+        prefill_scores = [
+            float(entries[response_ids[index]].logprob)
+            for entries, index in zip(prefill_entries, replay_positions, strict=True)
+        ]
+        prefill_top_ids = [
+            _top_by_rank(entries, count=1)[0] for entries in prefill_entries
+        ]
+
+        decode_start_index = max(len(prompt_ids), len(trajectory_ids) - 32)
+        decode_start = time.monotonic()
+        cached_replay = llm.generate(
+            [{"prompt_token_ids": trajectory_ids[:decode_start_index]}],
+            SamplingParams(
+                trace_decode_token_ids=trajectory_ids[decode_start_index:],
+                max_tokens=len(trajectory_ids) - decode_start_index,
+                temperature=0,
+                logprobs=1,
+                detokenize=False,
+                ignore_eos=True,
+            ),
+            use_tqdm=False,
+        )[0].outputs[0]
+        cached_replay_seconds = time.monotonic() - decode_start
+        if list(cached_replay.token_ids) != trajectory_ids[decode_start_index:]:
+            raise ValueError(f"GSM8K cached replay diverged for rank {global_rank}")
+        cached_scores = [
+            float(logprobs[token_id].logprob)
+            for token_id, logprobs in zip(
+                cached_replay.token_ids, cached_replay.logprobs, strict=True
+            )
+        ]
+        cached_top_ids = [
+            _top_by_rank(logprobs, count=1)[0]
+            for logprobs in cached_replay.logprobs
+        ]
+        cached_response_start = decode_start_index - len(prompt_ids)
         gsm8k_pilot = {
             "row_id": record["row_id"],
             "ground_truth": record["ground_truth"],
             "prompt_token_ids": prompt_ids,
             "response_token_ids": response_ids,
             "response_text": completion.text,
-            "response_logprobs": [
-                float(logprobs[token_id].logprob)
-                for token_id, logprobs in zip(
-                    response_ids, completion.logprobs, strict=True
-                )
-            ],
+            "response_logprobs": response_scores,
             "finish_reason": completion.finish_reason,
             "stop_reason": completion.stop_reason,
             "elapsed_seconds": duration,
+            "same_prefix": {
+                "prefill_replay_seconds": prefill_replay_seconds,
+                "cached_replay_seconds": cached_replay_seconds,
+                "prefill_response_indices": replay_positions,
+                "prefill_target_logprobs": prefill_scores,
+                "sampled_top_token_ids": [
+                    _top_by_rank(completion.logprobs[index], count=1)[0]
+                    for index in replay_positions
+                ],
+                "prefill_top_token_ids": prefill_top_ids,
+                "cached_response_start_index": cached_response_start,
+                "cached_target_logprobs": cached_scores,
+                "cached_top_token_ids": cached_top_ids,
+            },
             "routed_experts_shape": list(routes.shape),
             "routed_experts_sha256": _sha256(route_path),
             "routed_experts_uri": f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz",
             "sampling": {
                 "temperature": 1.0,
                 "top_p": 1.0,
-                "max_tokens": 256,
+                "max_tokens": response_budget,
+                "total_context_limit": CONTEXT_LIMIT,
                 "seed": 17 + global_rank,
             },
         }
@@ -744,14 +819,14 @@ def _run_rank(
             "model_runner": "v2",
             "trace_replay": True,
             "cached_decode_coverage": (
-                "last 31-32 tokens of each 8192-token case; plus positions "
-                "around the 2048- and 4096-token boundaries"
+                "last 31-32 tokens of each reference case; plus positions "
+                "around the 2048-token boundary"
             ),
             "max_model_len": MAX_MODEL_LEN,
             "max_model_len_note": (
-                "8193 lets the generate API return prompt logprobs for an "
-                "8192-token prompt; the one output token is discarded and no "
-                "score beyond the saved 8192-token prefix is used"
+                "4097 lets the generate API return prompt logprobs for a "
+                "4096-token prompt; the one output token is discarded and no "
+                "score beyond the saved 4096-token prefix is used"
             ),
             "max_num_batched_tokens": MAX_BATCHED_TOKENS,
             "max_num_seqs_per_rank": 1,
@@ -848,7 +923,9 @@ def main() -> None:
     input_evidence = {
         "golden_manifest_sha256": _sha256(golden_manifest_path),
         "golden_arrays_sha256": arrays_sha256,
-        "golden_context_diagnostic": golden_manifest["context_diagnostic"],
+        "golden_training_sequence_length": golden_manifest["model"]["resolved_config"][
+            "max_seq_len"
+        ],
         "export_manifest_sha256": _sha256(export_manifest_path),
         "export_config_sha256": _sha256(config_dir / "config.json"),
         "export_source_revision": export_manifest["source_revision"],
