@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Experimental full-Hero B200 qualification against retained Levanter goldens."""
+"""Experimental full-Hero H100/B200 qualification against retained goldens."""
 
 from __future__ import annotations
 
@@ -36,24 +36,27 @@ WEIGHT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
     "hero-535b-step108000-bf16-split-v3"
 )
+HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
+if HARDWARE not in {"GB200", "H100"}:
+    raise ValueError(f"Unsupported Hero pilot hardware {HARDWARE!r}")
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-rl/"
-    "step108000-b200-pilot-5a4a52329-01a0cc2c",
+    f"step108000-{HARDWARE.lower()}-pilot-5a4a52329-01a0cc2c",
 )
 VLLM_REVISION = "5a4a52329468b6bd16b21d1f319fcb96d405dd36"
-WORLD_SIZE = 8
-LOCAL_WORLD_SIZE = 4
+WORLD_SIZE = 32 if HARDWARE == "H100" else 8
+LOCAL_WORLD_SIZE = 8 if HARDWARE == "H100" else 4
 MASTER_PORT = 29555
 SIOCGIFADDR = 0x8915
 TOP_LOGPROBS = 64
-QUALIFICATION_GPUS_PER_TASK = 4
+QUALIFICATION_GPUS_PER_TASK = LOCAL_WORLD_SIZE
 QUALIFICATION_TASKS = WORLD_SIZE // QUALIFICATION_GPUS_PER_TASK
 PRECOMPILED_WHEEL = (
     "https://github.com/marin-community/vllm/releases/download/"
     "marin-vllm-gpu-candidate-fb02daf1d713/"
     "vllm-0.0.0.dev20260920%2Bmarin.fb02daf1d713.cu132-"
-    "cp38-abi3-manylinux_2_28_aarch64.whl"
+    f"cp38-abi3-manylinux_2_28_{'x86_64' if HARDWARE == 'H100' else 'aarch64'}.whl"
 )
 QUALIFICATION_SETUP = f"""\
 set -e
@@ -342,9 +345,10 @@ def _run_rank(
 
     with np.load(golden_path, allow_pickle=False) as source:
         arrays = {name: source[name] for name in source.files}
-    valid_length = int(arrays["valid_lengths"][global_rank])
-    tokens = [int(token) for token in arrays["tokens"][global_rank, :valid_length]]
-    prediction_indices = _rank_indices(arrays, global_rank)
+    case_index = global_rank % len(arrays["valid_lengths"])
+    valid_length = int(arrays["valid_lengths"][case_index])
+    tokens = [int(token) for token in arrays["tokens"][case_index, :valid_length]]
+    prediction_indices = _rank_indices(arrays, case_index)
 
     llm = LLM(
         model=config_dir,
@@ -407,6 +411,7 @@ def _run_rank(
                     "vllm_revision": VLLM_REVISION,
                     "input_evidence": input_evidence,
                     "rank": global_rank,
+                    "case_index": case_index,
                     "prompt_token_ids": pilot_prompt,
                     "response_token_ids": generated,
                     "response_logprobs": scores,
@@ -712,7 +717,7 @@ def main() -> None:
 
 
 def submit(iris_config: Path) -> None:
-    """Submit the fixed two-node B200 qualification job through Iris."""
+    """Submit the fixed-layout Hero qualification job through Iris."""
     from fray.iris_backend import (
         convert_constraints,
         convert_resources,
@@ -747,7 +752,7 @@ def submit(iris_config: Path) -> None:
         cpu=64,
         ram="400g",
         disk="1t",
-        device=GpuConfig(variant="GB200", count=QUALIFICATION_GPUS_PER_TASK),
+        device=GpuConfig(variant=HARDWARE, count=QUALIFICATION_GPUS_PER_TASK),
         replicas=QUALIFICATION_TASKS,
     )
     native_resources = convert_resources(resources)
@@ -762,7 +767,7 @@ def submit(iris_config: Path) -> None:
     ):
         job = client.submit(
             entrypoint=Entrypoint.from_command(
-                "python", "infra/qualification/hero_rl_b200_pilot.py"
+                "python", "infra/qualification/hero_rl_pilot.py"
             ),
             name=f"hero-vllm-qualification-{name_digest}",
             user="hero-vllm",
@@ -772,6 +777,7 @@ def submit(iris_config: Path) -> None:
                 env_vars={
                     "HERO_QUALIFICATION_REVISION": revision,
                     "HERO_PILOT": "1",
+                    "HERO_HARDWARE": HARDWARE,
                     "PYTHONUNBUFFERED": "1",
                 },
                 setup_scripts=[QUALIFICATION_SETUP],
