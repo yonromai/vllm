@@ -32,6 +32,10 @@ GOLDEN_ROOT = (
     "s3://marin-us-east-02a/marin/reference/hero-forward/"
     "hero-535b-step108000-bf16-v1-dcfe4ced165a"
 )
+FRESH_INPUT_ROOT = (
+    "s3://marin-us-east-02a/marin/users/romain/hero-numerical-resolution/"
+    "fp32-combine/hero-535b-step108000-bf16-fp32-combine-fresh-v1-123ec116ea42"
+)
 WEIGHT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
     "hero-535b-step108000-bf16-split-v3"
@@ -42,6 +46,9 @@ if HARDWARE not in {"GB200", "H100"}:
 PILOT = os.environ.get("HERO_PILOT", "1")
 if PILOT not in {"0", "1"}:
     raise ValueError(f"HERO_PILOT must be 0 or 1, got {PILOT!r}")
+RL_ROLLOUT = os.environ.get("HERO_RL_ROLLOUT", "0")
+if RL_ROLLOUT not in {"0", "1"} or (PILOT == "1" and RL_ROLLOUT == "1"):
+    raise ValueError("HERO_RL_ROLLOUT must be 0 or 1 and requires HERO_PILOT=0")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -49,7 +56,8 @@ RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-rl/"
     f"step108000-{HARDWARE.lower()}-"
-    f"{'pilot' if PILOT == '1' else 'original-4k'}-5a4a52329-01a0cc2c",
+    f"{'pilot' if PILOT == '1' else 'rl-64' if RL_ROLLOUT == '1' else 'original-4k'}"
+    "-5a4a52329-01a0cc2c",
 )
 VLLM_REVISION = "5a4a52329468b6bd16b21d1f319fcb96d405dd36"
 WORLD_SIZE = 32 if HARDWARE == "H100" else 8
@@ -327,6 +335,7 @@ def _run_rank(
     master_addr: str,
     config_dir: str,
     golden_path: str,
+    fresh_path: str | None,
     output_path: str,
     input_evidence: dict[str, Any],
 ) -> None:
@@ -356,6 +365,20 @@ def _run_rank(
     valid_length = int(arrays["valid_lengths"][case_index])
     tokens = [int(token) for token in arrays["tokens"][case_index, :valid_length]]
     prediction_indices = _rank_indices(arrays, case_index)
+    if RL_ROLLOUT == "1":
+        slot = global_rank % 8
+        bank = "original" if slot < 4 else "fresh"
+        case_index = (0, 2, 4, 6)[slot % 4]
+        if bank == "fresh":
+            if fresh_path is None:
+                raise ValueError("Fresh input bank was not downloaded")
+            with np.load(fresh_path, allow_pickle=False) as source:
+                arrays = {name: source[name] for name in source.files}
+        valid_length = int(arrays["valid_lengths"][case_index])
+        prompt_length = min(valid_length, 4032)
+        tokens = [
+            int(token) for token in arrays["tokens"][case_index, :prompt_length]
+        ]
 
     llm = LLM(
         model=config_dir,
@@ -384,6 +407,60 @@ def _run_rank(
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         disable_custom_all_reduce=True,
     )
+
+    if RL_ROLLOUT == "1":
+        rollout = llm.generate(
+            [{"prompt_token_ids": tokens}],
+            SamplingParams(
+                max_tokens=64,
+                temperature=0,
+                logprobs=5,
+                detokenize=False,
+                ignore_eos=True,
+            ),
+            use_tqdm=False,
+        )[0]
+        completion = rollout.outputs[0]
+        response = [int(token_id) for token_id in completion.token_ids]
+        routes = completion.routed_experts
+        if len(response) != 64 or routes is None:
+            raise ValueError("RL rollout did not return 64 tokens and full routes")
+        expected_shape = (len(tokens) + len(response) - 1, 48, 8)
+        if routes.shape != expected_shape:
+            raise ValueError(f"RL route shape {routes.shape} != {expected_shape}")
+        route_path = Path(output_path).with_suffix(".routes.npz")
+        np.savez_compressed(route_path, routed_experts=routes.astype(np.int16))
+        Path(output_path).write_text(
+            json.dumps(
+                {
+                    "checkpoint": CHECKPOINT,
+                    "weight_root": WEIGHT_ROOT,
+                    "vllm_revision": VLLM_REVISION,
+                    "qualification_revision": os.environ["HERO_QUALIFICATION_REVISION"],
+                    "input_evidence": input_evidence,
+                    "rank": global_rank,
+                    "bank": bank,
+                    "case_index": case_index,
+                    "prompt_token_ids": tokens,
+                    "response_token_ids": response,
+                    "response_logprobs": [
+                        float(logprobs[token_id].logprob)
+                        for token_id, logprobs in zip(
+                            response, completion.logprobs, strict=True
+                        )
+                    ],
+                    "routed_experts_shape": list(routes.shape),
+                    "routed_experts_sha256": _sha256(route_path),
+                    "routed_experts_uri": (
+                        f"{RESULT_ROOT}/rank-{global_rank}.routes.npz"
+                    ),
+                },
+                sort_keys=True,
+            ) + "\n"
+        )
+        _wait_for_all_ranks(_s3_client(), global_rank)
+        llm.llm_engine.engine_core.shutdown()
+        return
 
     if PILOT == "1":
         pilot_prompt = tokens[: min(valid_length, 32)]
@@ -543,7 +620,6 @@ def _run_rank(
 
     result = {
         "case_index": case_index,
-        "global_rank": global_rank,
         "valid_length": valid_length,
         "checkpoint": CHECKPOINT,
         "golden_root": GOLDEN_ROOT,
@@ -635,11 +711,16 @@ def main() -> None:
     config_dir = local_root / "model-config"
     arrays_path = local_root / "golden-arrays.npz"
     golden_manifest_path = local_root / "golden-manifest.json"
+    fresh_arrays_path = local_root / "fresh-arrays.npz"
+    fresh_manifest_path = local_root / "fresh-manifest.json"
     export_manifest_path = local_root / "export-manifest.json"
     _download(client, f"{WEIGHT_ROOT}/config.json", config_dir / "config.json")
     _download(client, f"{GOLDEN_ROOT}/arrays.npz", arrays_path)
     _download(client, f"{GOLDEN_ROOT}/manifest.json", golden_manifest_path)
     _download(client, f"{WEIGHT_ROOT}/export-manifest.json", export_manifest_path)
+    if RL_ROLLOUT == "1":
+        _download(client, f"{FRESH_INPUT_ROOT}/arrays.npz", fresh_arrays_path)
+        _download(client, f"{FRESH_INPUT_ROOT}/manifest.json", fresh_manifest_path)
 
     golden_manifest = json.loads(golden_manifest_path.read_text())
     export_manifest = json.loads(export_manifest_path.read_text())
@@ -680,6 +761,23 @@ def main() -> None:
         "pending_qb_betas_sha256": export_manifest["pending_qb_betas_sha256"],
         "expert_tensor_layout": export_manifest["expert_tensor_layout"],
     }
+    if RL_ROLLOUT == "1":
+        fresh_manifest = json.loads(fresh_manifest_path.read_text())
+        fresh_sha256 = _sha256(fresh_arrays_path)
+        if fresh_manifest["asset_root"] != FRESH_INPUT_ROOT:
+            raise ValueError("Fresh input manifest root does not match")
+        if fresh_manifest["checkpoint"]["uri"] != CHECKPOINT:
+            raise ValueError("Fresh input bank uses a different checkpoint")
+        if fresh_manifest["files"]["arrays.npz"]["sha256"] != fresh_sha256:
+            raise ValueError("Fresh input arrays fail retained SHA-256")
+        input_evidence.update(
+            {
+                "fresh_input_root": FRESH_INPUT_ROOT,
+                "fresh_input_arrays_sha256": fresh_sha256,
+                "fresh_input_manifest_sha256": _sha256(fresh_manifest_path),
+                "fresh_scores_are_not_used": True,
+            }
+        )
 
     context = mp.get_context("spawn")
     processes: list[tuple[int, Path, mp.Process]] = []
@@ -694,6 +792,7 @@ def main() -> None:
                 master_addr,
                 str(config_dir),
                 str(arrays_path),
+                str(fresh_arrays_path) if RL_ROLLOUT == "1" else None,
                 str(output_path),
                 input_evidence,
             ),
@@ -725,6 +824,12 @@ def main() -> None:
         result_uri = f"{RESULT_ROOT}/rank-{global_rank}.json"
         _put_json(client, result_uri, json.loads(output_path.read_text()))
         print(f"uploaded {result_uri}", flush=True)
+        if RL_ROLLOUT == "1":
+            route_path = output_path.with_suffix(".routes.npz")
+            route_uri = f"{RESULT_ROOT}/rank-{global_rank}.routes.npz"
+            bucket, key = _s3_parts(route_uri)
+            client.upload_file(str(route_path), bucket, key)
+            print(f"uploaded {route_uri}", flush=True)
 
 
 def submit(iris_config: Path) -> None:
@@ -788,6 +893,7 @@ def submit(iris_config: Path) -> None:
                 env_vars={
                     "HERO_QUALIFICATION_REVISION": revision,
                     "HERO_PILOT": PILOT,
+                    "HERO_RL_ROLLOUT": RL_ROLLOUT,
                     "HERO_HARDWARE": HARDWARE,
                     "HERO_RESULT_ROOT": RESULT_ROOT,
                     "HERO_GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
