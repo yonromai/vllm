@@ -50,6 +50,9 @@ GSM8K_INPUT_URI = (
 )
 GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
 MAX_MODEL_LEN = 8193
+# Bound vLLM's startup dummy run and MoE workspace on 80 GiB H100s. The
+# 8192-token prefill is scheduled in chunks; its scored positions stay intact.
+MAX_BATCHED_TOKENS = 2048
 HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
 if HARDWARE not in {"GB200", "H100"}:
     raise ValueError(f"Unsupported Hero pilot hardware {HARDWARE!r}")
@@ -426,11 +429,12 @@ def _run_rank(
         attention_config={"backend": "FLASH_ATTN", "flash_attn_version": 2},
         enforce_eager=True,
         enable_prefix_caching=False,
+        enable_chunked_prefill=True,
         enable_trace_replay=True,
         enable_return_routed_experts=True,
         max_logprobs=TOP_LOGPROBS,
         max_num_seqs=1,
-        max_num_batched_tokens=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_BATCHED_TOKENS,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         disable_custom_all_reduce=True,
     )
@@ -736,6 +740,7 @@ def _run_rank(
             "flash_attn_version": 2,
             "enforce_eager": True,
             "enable_prefix_caching": False,
+            "enable_chunked_prefill": True,
             "model_runner": "v2",
             "trace_replay": True,
             "cached_decode_coverage": (
@@ -748,7 +753,7 @@ def _run_rank(
                 "8192-token prompt; the one output token is discarded and no "
                 "score beyond the saved 8192-token prefix is used"
             ),
-            "max_num_batched_tokens": MAX_MODEL_LEN,
+            "max_num_batched_tokens": MAX_BATCHED_TOKENS,
             "max_num_seqs_per_rank": 1,
             "load_format": "runai_streamer",
             "runai_distributed": True,
