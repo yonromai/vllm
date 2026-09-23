@@ -39,10 +39,14 @@ WEIGHT_ROOT = (
 HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
 if HARDWARE not in {"GB200", "H100"}:
     raise ValueError(f"Unsupported Hero pilot hardware {HARDWARE!r}")
+PILOT = os.environ.get("HERO_PILOT", "1")
+if PILOT not in {"0", "1"}:
+    raise ValueError(f"HERO_PILOT must be 0 or 1, got {PILOT!r}")
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-rl/"
-    f"step108000-{HARDWARE.lower()}-pilot-5a4a52329-01a0cc2c",
+    f"step108000-{HARDWARE.lower()}-"
+    f"{'pilot' if PILOT == '1' else 'original-4k'}-5a4a52329-01a0cc2c",
 )
 VLLM_REVISION = "5a4a52329468b6bd16b21d1f319fcb96d405dd36"
 WORLD_SIZE = 32 if HARDWARE == "H100" else 8
@@ -378,7 +382,7 @@ def _run_rank(
         disable_custom_all_reduce=True,
     )
 
-    if os.environ.get("HERO_PILOT") == "1":
+    if PILOT == "1":
         pilot_prompt = tokens[: min(valid_length, 32)]
         pilot_output = llm.generate(
             [{"prompt_token_ids": pilot_prompt}],
@@ -533,7 +537,8 @@ def _run_rank(
     ]
 
     result = {
-        "case_index": global_rank,
+        "case_index": case_index,
+        "global_rank": global_rank,
         "valid_length": valid_length,
         "checkpoint": CHECKPOINT,
         "golden_root": GOLDEN_ROOT,
@@ -776,8 +781,9 @@ def submit(iris_config: Path) -> None:
             environment=EnvironmentSpec(
                 env_vars={
                     "HERO_QUALIFICATION_REVISION": revision,
-                    "HERO_PILOT": "1",
+                    "HERO_PILOT": PILOT,
                     "HERO_HARDWARE": HARDWARE,
+                    "HERO_RESULT_ROOT": RESULT_ROOT,
                     "PYTHONUNBUFFERED": "1",
                 },
                 setup_scripts=[QUALIFICATION_SETUP],
