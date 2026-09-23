@@ -30,6 +30,10 @@ CHECKPOINT = (
 )
 GOLDEN_ROOT = (
     "s3://marin-us-east-02a/marin/reference/hero-forward/"
+    "hero-535b-step108000-bf16-8k-diagnostic-v1-5a7dffedea5c"
+)
+EXPORT_GOLDEN_ROOT = (
+    "s3://marin-us-east-02a/marin/reference/hero-forward/"
     "hero-535b-step108000-bf16-v1-dcfe4ced165a"
 )
 FRESH_INPUT_ROOT = (
@@ -40,6 +44,12 @@ WEIGHT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
     "hero-535b-step108000-bf16-split-v3"
 )
+GSM8K_INPUT_URI = (
+    "s3://marin-us-east-02a/marin/users/romain/hero-gsm8k-async-01a0cc2c/"
+    "inputs/train-0-31-v1.json"
+)
+GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
+MAX_MODEL_LEN = 8193
 HARDWARE = os.environ.get("HERO_HARDWARE", "GB200")
 if HARDWARE not in {"GB200", "H100"}:
     raise ValueError(f"Unsupported Hero pilot hardware {HARDWARE!r}")
@@ -49,15 +59,27 @@ if PILOT not in {"0", "1"}:
 RL_ROLLOUT = os.environ.get("HERO_RL_ROLLOUT", "0")
 if RL_ROLLOUT not in {"0", "1"} or (PILOT == "1" and RL_ROLLOUT == "1"):
     raise ValueError("HERO_RL_ROLLOUT must be 0 or 1 and requires HERO_PILOT=0")
+GSM8K_PILOT = os.environ.get("HERO_GSM8K_PILOT", "0")
+if GSM8K_PILOT not in {"0", "1"} or (
+    GSM8K_PILOT == "1" and (PILOT == "1" or RL_ROLLOUT == "1")
+):
+    raise ValueError("HERO_GSM8K_PILOT requires HERO_PILOT=0 and HERO_RL_ROLLOUT=0")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
+MODE_NAME = (
+    "pilot"
+    if PILOT == "1"
+    else "rl-64"
+    if RL_ROLLOUT == "1"
+    else "native-8k-gsm8k"
+)
 RESULT_ROOT = os.environ.get(
     "HERO_RESULT_ROOT",
-    "s3://marin-us-east-02a/marin/users/romain/hero-vllm-rl/"
+    "s3://marin-us-east-02a/marin/users/romain/hero-gsm8k-async-01a0cc2c/"
     f"step108000-{HARDWARE.lower()}-"
-    f"{'pilot' if PILOT == '1' else 'rl-64' if RL_ROLLOUT == '1' else 'original-4k'}"
-    "-5a4a52329-01a0cc2c",
+    f"{MODE_NAME}"
+    "-5a4a52329",
 )
 VLLM_REVISION = "5a4a52329468b6bd16b21d1f319fcb96d405dd36"
 WORLD_SIZE = 32 if HARDWARE == "H100" else 8
@@ -340,6 +362,7 @@ def _run_rank(
     config_dir: str,
     golden_path: str,
     fresh_path: str | None,
+    gsm8k_inputs_path: str | None,
     output_path: str,
     input_evidence: dict[str, Any],
 ) -> None:
@@ -390,7 +413,7 @@ def _run_rank(
         tokenizer=config_dir,
         skip_tokenizer_init=True,
         dtype="bfloat16",
-        max_model_len=4097,
+        max_model_len=MAX_MODEL_LEN,
         load_format="runai_streamer",
         model_loader_extra_config={
             "distributed": True,
@@ -407,7 +430,7 @@ def _run_rank(
         enable_return_routed_experts=True,
         max_logprobs=TOP_LOGPROBS,
         max_num_seqs=1,
-        max_num_batched_tokens=4097,
+        max_num_batched_tokens=MAX_MODEL_LEN,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         disable_custom_all_reduce=True,
     )
@@ -566,7 +589,9 @@ def _run_rank(
     windows = [(max(1, valid_length - 32), valid_length)]
     if valid_length >= 4095:
         windows.append((2040, 2052))
-    # Queue both windows together: offline DP/EP must keep every rank in the
+    if valid_length >= 8192:
+        windows.append((4088, 4100))
+    # Queue all windows together: offline DP/EP must keep every rank in the
     # same engine wave until all ranks have completed their collective steps.
     decode_outputs = llm.generate(
         [{"prompt_token_ids": tokens[:start]} for start, _ in windows],
@@ -622,6 +647,60 @@ def _run_rank(
         for prompt_length, end in windows
     ]
 
+    gsm8k_pilot = None
+    if gsm8k_inputs_path is not None:
+        pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
+        record = pilot_inputs["records"][global_rank]
+        prompt_ids = record["hero_prompt_token_ids"]
+        start = time.monotonic()
+        rollout = llm.generate(
+            [{"prompt_token_ids": prompt_ids}],
+            SamplingParams(
+                max_tokens=256,
+                temperature=1.0,
+                top_p=1.0,
+                logprobs=5,
+                detokenize=True,
+                seed=17 + global_rank,
+            ),
+            use_tqdm=False,
+        )[0]
+        duration = time.monotonic() - start
+        completion = rollout.outputs[0]
+        response_ids = [int(token_id) for token_id in completion.token_ids]
+        routes = completion.routed_experts
+        expected_shape = (len(prompt_ids) + len(response_ids) - 1, 48, 8)
+        if routes is None or routes.shape != expected_shape:
+            observed_shape = None if routes is None else routes.shape
+            raise ValueError(f"GSM8K route shape {observed_shape} != {expected_shape}")
+        route_path = Path(output_path).with_suffix(".gsm8k.routes.npz")
+        np.savez_compressed(route_path, routed_experts=routes.astype(np.int16))
+        gsm8k_pilot = {
+            "row_id": record["row_id"],
+            "ground_truth": record["ground_truth"],
+            "prompt_token_ids": prompt_ids,
+            "response_token_ids": response_ids,
+            "response_text": completion.text,
+            "response_logprobs": [
+                float(logprobs[token_id].logprob)
+                for token_id, logprobs in zip(
+                    response_ids, completion.logprobs, strict=True
+                )
+            ],
+            "finish_reason": completion.finish_reason,
+            "stop_reason": completion.stop_reason,
+            "elapsed_seconds": duration,
+            "routed_experts_shape": list(routes.shape),
+            "routed_experts_sha256": _sha256(route_path),
+            "routed_experts_uri": f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz",
+            "sampling": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_tokens": 256,
+                "seed": 17 + global_rank,
+            },
+        }
+
     result = {
         "case_index": case_index,
         "valid_length": valid_length,
@@ -660,16 +739,16 @@ def _run_rank(
             "model_runner": "v2",
             "trace_replay": True,
             "cached_decode_coverage": (
-                "last 31-32 tokens of each case; plus positions around the "
-                "2048-token boundary in the 4095- and 4096-token cases"
+                "last 31-32 tokens of each 8192-token case; plus positions "
+                "around the 2048- and 4096-token boundaries"
             ),
-            "max_model_len": 4097,
+            "max_model_len": MAX_MODEL_LEN,
             "max_model_len_note": (
-                "4097 only lets the generate API return prompt logprobs for a "
-                "4096-token prompt; the one output token is discarded and no "
-                "score beyond the saved 4096-token prefix is used"
+                "8193 lets the generate API return prompt logprobs for an "
+                "8192-token prompt; the one output token is discarded and no "
+                "score beyond the saved 8192-token prefix is used"
             ),
-            "max_num_batched_tokens": 4097,
+            "max_num_batched_tokens": MAX_MODEL_LEN,
             "max_num_seqs_per_rank": 1,
             "load_format": "runai_streamer",
             "runai_distributed": True,
@@ -688,6 +767,7 @@ def _run_rank(
         "short": short,
         "prefill": prefill,
         "cached_decode": decode,
+        "gsm8k_pilot": gsm8k_pilot,
     }
     Path(output_path).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     _wait_for_all_ranks(_s3_client(), global_rank)
@@ -717,11 +797,16 @@ def main() -> None:
     golden_manifest_path = local_root / "golden-manifest.json"
     fresh_arrays_path = local_root / "fresh-arrays.npz"
     fresh_manifest_path = local_root / "fresh-manifest.json"
+    gsm8k_inputs_path = local_root / "gsm8k-inputs.json"
     export_manifest_path = local_root / "export-manifest.json"
     _download(client, f"{WEIGHT_ROOT}/config.json", config_dir / "config.json")
     _download(client, f"{GOLDEN_ROOT}/arrays.npz", arrays_path)
     _download(client, f"{GOLDEN_ROOT}/manifest.json", golden_manifest_path)
     _download(client, f"{WEIGHT_ROOT}/export-manifest.json", export_manifest_path)
+    if GSM8K_PILOT == "1":
+        _download(client, GSM8K_INPUT_URI, gsm8k_inputs_path)
+        if _sha256(gsm8k_inputs_path) != GSM8K_INPUT_SHA256:
+            raise ValueError("GSM8K pilot inputs fail their retained SHA-256")
     if RL_ROLLOUT == "1":
         _download(client, f"{FRESH_INPUT_ROOT}/arrays.npz", fresh_arrays_path)
         _download(client, f"{FRESH_INPUT_ROOT}/manifest.json", fresh_manifest_path)
@@ -743,7 +828,7 @@ def main() -> None:
         "effective_weight_dtype": "bfloat16",
         "global_device_count": 32,
         "process_count": 32,
-        "golden_bundle": GOLDEN_ROOT,
+        "golden_bundle": EXPORT_GOLDEN_ROOT,
     }
     for field, expected in required_export_fields.items():
         if export_manifest.get(field) != expected:
@@ -758,6 +843,7 @@ def main() -> None:
     input_evidence = {
         "golden_manifest_sha256": _sha256(golden_manifest_path),
         "golden_arrays_sha256": arrays_sha256,
+        "golden_context_diagnostic": golden_manifest["context_diagnostic"],
         "export_manifest_sha256": _sha256(export_manifest_path),
         "export_config_sha256": _sha256(config_dir / "config.json"),
         "export_source_revision": export_manifest["source_revision"],
@@ -765,6 +851,16 @@ def main() -> None:
         "pending_qb_betas_sha256": export_manifest["pending_qb_betas_sha256"],
         "expert_tensor_layout": export_manifest["expert_tensor_layout"],
     }
+    if GSM8K_PILOT == "1":
+        pilot_inputs = json.loads(gsm8k_inputs_path.read_text())
+        if len(pilot_inputs["records"]) < WORLD_SIZE:
+            raise ValueError("GSM8K pilot requires one distinct question per rank")
+        input_evidence.update(
+            {
+                "gsm8k_inputs_uri": GSM8K_INPUT_URI,
+                "gsm8k_inputs_sha256": GSM8K_INPUT_SHA256,
+            }
+        )
     if RL_ROLLOUT == "1":
         fresh_manifest = json.loads(fresh_manifest_path.read_text())
         fresh_sha256 = _sha256(fresh_arrays_path)
@@ -797,6 +893,7 @@ def main() -> None:
                 str(config_dir),
                 str(arrays_path),
                 str(fresh_arrays_path) if RL_ROLLOUT == "1" else None,
+                str(gsm8k_inputs_path) if GSM8K_PILOT == "1" else None,
                 str(output_path),
                 input_evidence,
             ),
@@ -831,6 +928,12 @@ def main() -> None:
         if RL_ROLLOUT == "1":
             route_path = output_path.with_suffix(".routes.npz")
             route_uri = f"{RESULT_ROOT}/rank-{global_rank}.routes.npz"
+            bucket, key = _s3_parts(route_uri)
+            client.upload_file(str(route_path), bucket, key)
+            print(f"uploaded {route_uri}", flush=True)
+        if GSM8K_PILOT == "1":
+            route_path = output_path.with_suffix(".gsm8k.routes.npz")
+            route_uri = f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz"
             bucket, key = _s3_parts(route_uri)
             client.upload_file(str(route_path), bucket, key)
             print(f"uploaded {route_uri}", flush=True)
@@ -898,6 +1001,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_QUALIFICATION_REVISION": revision,
                     "HERO_PILOT": PILOT,
                     "HERO_RL_ROLLOUT": RL_ROLLOUT,
+                    "HERO_GSM8K_PILOT": GSM8K_PILOT,
                     "HERO_HARDWARE": HARDWARE,
                     "HERO_RESULT_ROOT": RESULT_ROOT,
                     "HERO_GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
@@ -912,7 +1016,7 @@ def submit(iris_config: Path) -> None:
             max_retries_failure=0,
             max_retries_preemption=0,
             max_task_failures=0,
-            priority_band=priority_band_value("interactive"),
+            priority_band=priority_band_value("production"),
             existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
         )
     print(job.job_id)
