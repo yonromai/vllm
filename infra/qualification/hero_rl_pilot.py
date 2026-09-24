@@ -638,9 +638,7 @@ def _run_rank(
         return
 
     if NATURAL_TRACE != "0":
-        if global_rank in TRACE_TARGETS:
-            # Initialization profiles the model with synthetic tokens. Arm only
-            # after that profiling, so history files describe this request.
+        if global_rank in TRACE_TARGETS and PREFILL_ONLY_TRACE == "0":
             trace_arm.write_text("sample\n")
         assert gsm8k_inputs_path is not None
         pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
@@ -654,6 +652,21 @@ def _run_rank(
         if prompt_ids != saved["prompt_token_ids"]:
             raise ValueError(f"Saved prompt differs at rank {global_rank}")
         if PREFILL_ONLY_TRACE == "1":
+            # Position zero also occurs in the first request's synthetic
+            # profiling batch. Run that request unarmed, then replay it exactly.
+            llm.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                SamplingParams(
+                    max_tokens=1,
+                    temperature=0,
+                    prompt_logprobs=1,
+                    detokenize=False,
+                    ignore_eos=True,
+                ),
+                use_tqdm=False,
+            )
+            if global_rank in TRACE_TARGETS:
+                trace_arm.write_text("sample\n")
             short_start = time.monotonic()
             short = llm.generate(
                 [{"prompt_token_ids": prompt_ids}],
