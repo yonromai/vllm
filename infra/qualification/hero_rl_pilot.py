@@ -597,7 +597,7 @@ def _run_rank(
             SamplingParams(
                 max_tokens=1,
                 temperature=0,
-                prompt_logprobs=1,
+                prompt_logprobs=5,
                 detokenize=False,
                 ignore_eos=True,
             ),
@@ -621,6 +621,26 @@ def _run_rank(
             full_prefill_routes=full_routes.astype(np.int16),
         )
         capture["routed_experts_sha256"] = _sha256(route_path)
+        top1_mismatch_details = []
+        for index, (sampled, full) in enumerate(
+            zip(rollout.logprobs, entries, strict=True)
+        ):
+            sampled_top = _top_by_rank(sampled, count=2)
+            full_top = _top_by_rank(full, count=2)
+            if sampled_top[0] != full_top[0]:
+                top1_mismatch_details.append(
+                    {
+                        "response_index": index,
+                        "sampled_top_ids": sampled_top,
+                        "sampled_top_logprobs": [
+                            float(sampled[token_id].logprob) for token_id in sampled_top
+                        ],
+                        "full_top_ids": full_top,
+                        "full_top_logprobs": [
+                            float(full[token_id].logprob) for token_id in full_top
+                        ],
+                    }
+                )
         capture["same_prefix"] = {
             "prefill_replay_seconds": prefill_seconds,
             "full_prefill_target_logprobs": [
@@ -628,13 +648,9 @@ def _run_rank(
                 for entry, token_id in zip(entries, response_ids, strict=True)
             ],
             "full_prefill_top1_mismatch_indices": [
-                index
-                for index, (sampled, full) in enumerate(
-                    zip(rollout.logprobs, entries, strict=True)
-                )
-                if _top_by_rank(sampled, count=1)[0]
-                != _top_by_rank(full, count=1)[0]
+                detail["response_index"] for detail in top1_mismatch_details
             ],
+            "full_prefill_top1_mismatch_details": top1_mismatch_details,
             "full_prefill_routes_shape": list(full_routes.shape),
         }
         partial_path.write_text(json.dumps(result, sort_keys=True) + "\n")
