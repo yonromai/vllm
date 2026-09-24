@@ -24,9 +24,10 @@ from typing import Any
 
 import numpy as np
 
-CHECKPOINT = (
+CHECKPOINT = os.environ.get(
+    "HERO_CHECKPOINT",
     "s3://marin-us-east-02a/marin/grug/hero-ragged_a2a-nccl2307-ep-step81k/"
-    "2026.08.19.2/checkpoints/step-108000"
+    "2026.08.19.2/checkpoints/step-108000",
 )
 GOLDEN_ROOT = (
     "s3://marin-us-east-02a/marin/reference/hero-forward/"
@@ -37,9 +38,10 @@ FRESH_INPUT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-numerical-resolution/"
     "fp32-combine/hero-535b-step108000-bf16-fp32-combine-fresh-v1-123ec116ea42"
 )
-WEIGHT_ROOT = (
+WEIGHT_ROOT = os.environ.get(
+    "HERO_WEIGHT_ROOT",
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
-    "hero-535b-step108000-bf16-split-v3"
+    "hero-535b-step108000-bf16-split-v3",
 )
 GSM8K_INPUT_URI = os.environ.get(
     "HERO_GSM8K_INPUT_URI",
@@ -84,10 +86,17 @@ if GSM8K_PILOT not in {"0", "1"} or (
     GSM8K_PILOT == "1" and (PILOT == "1" or RL_ROLLOUT == "1")
 ):
     raise ValueError("HERO_GSM8K_PILOT requires HERO_PILOT=0 and HERO_RL_ROLLOUT=0")
+MODEL_ONLY_GSM8K = os.environ.get("HERO_MODEL_ONLY_GSM8K", "0")
+if MODEL_ONLY_GSM8K not in {"0", "1"} or (
+    MODEL_ONLY_GSM8K == "1" and GSM8K_PILOT != "1"
+):
+    raise ValueError("HERO_MODEL_ONLY_GSM8K requires HERO_GSM8K_PILOT=1")
 if NATURAL_TRACE not in {"0", "1", "2"} or (
     NATURAL_TRACE != "0" and GSM8K_PILOT != "1"
 ):
     raise ValueError("HERO_NATURAL_TRACE requires HERO_GSM8K_PILOT=1")
+if MODEL_ONLY_GSM8K == "1" and NATURAL_TRACE != "0":
+    raise ValueError("HERO_MODEL_ONLY_GSM8K requires HERO_NATURAL_TRACE=0")
 if PAD_KV_ROWS < 0:
     raise ValueError("HERO_NUMERIC_PAD_KV_ROWS must be nonnegative")
 if KV_HISTORY not in {"0", "1"} or (KV_HISTORY == "1" and NATURAL_TRACE == "0"):
@@ -423,12 +432,19 @@ def _run_rank(
     )
     from vllm import LLM, SamplingParams
 
-    with np.load(golden_path, allow_pickle=False) as source:
-        arrays = {name: source[name] for name in source.files}
-    case_index = global_rank % len(arrays["valid_lengths"])
-    valid_length = int(arrays["valid_lengths"][case_index])
-    tokens = [int(token) for token in arrays["tokens"][case_index, :valid_length]]
-    prediction_indices = _rank_indices(arrays, case_index)
+    if MODEL_ONLY_GSM8K == "1":
+        arrays: dict[str, Any] = {}
+        case_index = global_rank
+        valid_length = 0
+        tokens: list[int] = []
+        prediction_indices = np.empty(0, dtype=np.int32)
+    else:
+        with np.load(golden_path, allow_pickle=False) as source:
+            arrays = {name: source[name] for name in source.files}
+        case_index = global_rank % len(arrays["valid_lengths"])
+        valid_length = int(arrays["valid_lengths"][case_index])
+        tokens = [int(token) for token in arrays["tokens"][case_index, :valid_length]]
+        prediction_indices = _rank_indices(arrays, case_index)
     if RL_ROLLOUT == "1":
         slot = global_rank % 8
         bank = "original" if slot < 4 else "fresh"
@@ -494,6 +510,132 @@ def _run_rank(
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         disable_custom_all_reduce=True,
     )
+
+    if MODEL_ONLY_GSM8K == "1":
+        assert gsm8k_inputs_path is not None
+        record = json.loads(Path(gsm8k_inputs_path).read_text())["records"][global_rank]
+        prompt_ids = record["hero_prompt_token_ids"]
+        response_budget = CONTEXT_LIMIT - len(prompt_ids)
+        if response_budget <= 0:
+            raise ValueError(f"GSM8K prompt {global_rank} exceeds the context limit")
+        rollout_start = time.monotonic()
+        rollout = llm.generate(
+            [{"prompt_token_ids": prompt_ids}],
+            SamplingParams(
+                max_tokens=response_budget,
+                temperature=1.0,
+                top_p=1.0,
+                logprobs=5,
+                detokenize=False,
+                seed=17 + global_rank,
+                stop_token_ids=[HERO_TURN_END_TOKEN_ID],
+            ),
+            use_tqdm=False,
+        )[0].outputs[0]
+        rollout_seconds = time.monotonic() - rollout_start
+        response_ids = [int(token_id) for token_id in rollout.token_ids]
+        if not response_ids:
+            raise ValueError(f"GSM8K rank {global_rank} returned no response tokens")
+        response_scores = [
+            float(entries[token_id].logprob)
+            for token_id, entries in zip(response_ids, rollout.logprobs, strict=True)
+        ]
+        routes = rollout.routed_experts
+        expected_shape = (len(prompt_ids) + len(response_ids) - 1, 48, 8)
+        if routes is None or routes.shape != expected_shape:
+            observed_shape = None if routes is None else routes.shape
+            raise ValueError(f"GSM8K route shape {observed_shape} != {expected_shape}")
+        route_path = Path(output_path).with_suffix(".gsm8k.routes.npz")
+        np.savez_compressed(route_path, routed_experts=routes.astype(np.int16))
+        capture = {
+            "row_id": record["row_id"],
+            "group_id": record.get("group_id"),
+            "group_sample_index": record.get("group_sample_index"),
+            "source_rank": record.get("source_rank"),
+            "ground_truth": record["ground_truth"],
+            "prompt_token_ids": prompt_ids,
+            "response_token_ids": response_ids,
+            "response_text": rollout.text,
+            "response_logprobs": response_scores,
+            "finish_reason": rollout.finish_reason,
+            "stop_reason": rollout.stop_reason,
+            "elapsed_seconds": rollout_seconds,
+            "routed_experts_shape": list(routes.shape),
+            "routed_experts_sha256": _sha256(route_path),
+            "routed_experts_uri": f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz",
+            "sampling": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_tokens": response_budget,
+                "total_context_limit": CONTEXT_LIMIT,
+                "seed": 17 + global_rank,
+                "stop_token_ids": [HERO_TURN_END_TOKEN_ID],
+            },
+        }
+        result = {
+            "checkpoint": CHECKPOINT,
+            "weight_root": WEIGHT_ROOT,
+            "model_only_gsm8k": True,
+            "vllm_revision": VLLM_REVISION,
+            "qualification_revision": os.environ["HERO_QUALIFICATION_REVISION"],
+            "input_evidence": input_evidence,
+            "global_rank": global_rank,
+            "gsm8k_pilot": capture,
+        }
+        partial_path = Path(output_path).with_suffix(".gsm8k.partial.json")
+        partial_path.write_text(json.dumps(result, sort_keys=True) + "\n")
+        trajectory_ids = prompt_ids + response_ids
+        prefill_start = time.monotonic()
+        prefill = llm.generate(
+            [{"prompt_token_ids": trajectory_ids}],
+            SamplingParams(
+                max_tokens=1,
+                temperature=0,
+                prompt_logprobs=1,
+                detokenize=False,
+                ignore_eos=True,
+            ),
+            use_tqdm=False,
+        )[0]
+        prefill_seconds = time.monotonic() - prefill_start
+        entries = prefill.prompt_logprobs[len(prompt_ids) : len(trajectory_ids)]
+        if len(entries) != len(response_ids):
+            raise ValueError("Current-weight prefill scores are incomplete")
+        full_routes = prefill.outputs[0].routed_experts
+        expected_full_shape = (len(trajectory_ids), 48, 8)
+        if full_routes is None or full_routes.shape != expected_full_shape:
+            observed_shape = None if full_routes is None else full_routes.shape
+            raise ValueError(
+                f"Current-weight prefill route shape {observed_shape} "
+                f"!= {expected_full_shape}"
+            )
+        np.savez_compressed(
+            route_path,
+            routed_experts=routes.astype(np.int16),
+            full_prefill_routes=full_routes.astype(np.int16),
+        )
+        capture["routed_experts_sha256"] = _sha256(route_path)
+        capture["same_prefix"] = {
+            "prefill_replay_seconds": prefill_seconds,
+            "full_prefill_target_logprobs": [
+                float(entry[token_id].logprob)
+                for entry, token_id in zip(entries, response_ids, strict=True)
+            ],
+            "full_prefill_top1_mismatch_indices": [
+                index
+                for index, (sampled, full) in enumerate(
+                    zip(rollout.logprobs, entries, strict=True)
+                )
+                if _top_by_rank(sampled, count=1)[0]
+                != _top_by_rank(full, count=1)[0]
+            ],
+            "full_prefill_routes_shape": list(full_routes.shape),
+        }
+        partial_path.write_text(json.dumps(result, sort_keys=True) + "\n")
+        Path(output_path).write_text(json.dumps(result, sort_keys=True) + "\n")
+        _wait_for_all_ranks(_s3_client(), global_rank)
+        llm.llm_engine.engine_core.shutdown()
+        return
 
     if NATURAL_TRACE != "0":
         if global_rank in TRACE_TARGETS:
@@ -1247,8 +1389,9 @@ def main() -> None:
     gsm8k_inputs_path = local_root / "gsm8k-inputs.json"
     export_manifest_path = local_root / "export-manifest.json"
     _download(client, f"{WEIGHT_ROOT}/config.json", config_dir / "config.json")
-    _download(client, f"{GOLDEN_ROOT}/arrays.npz", arrays_path)
-    _download(client, f"{GOLDEN_ROOT}/manifest.json", golden_manifest_path)
+    if MODEL_ONLY_GSM8K == "0":
+        _download(client, f"{GOLDEN_ROOT}/arrays.npz", arrays_path)
+        _download(client, f"{GOLDEN_ROOT}/manifest.json", golden_manifest_path)
     _download(client, f"{WEIGHT_ROOT}/export-manifest.json", export_manifest_path)
     if GSM8K_PILOT == "1":
         _download(client, GSM8K_INPUT_URI, gsm8k_inputs_path)
@@ -1258,41 +1401,14 @@ def main() -> None:
         _download(client, f"{FRESH_INPUT_ROOT}/arrays.npz", fresh_arrays_path)
         _download(client, f"{FRESH_INPUT_ROOT}/manifest.json", fresh_manifest_path)
 
-    golden_manifest = json.loads(golden_manifest_path.read_text())
     export_manifest = json.loads(export_manifest_path.read_text())
-    arrays_sha256 = _sha256(arrays_path)
-    if golden_manifest["asset_root"] != GOLDEN_ROOT:
-        raise ValueError("Golden manifest asset root does not match the pinned root")
-    if golden_manifest["checkpoint"]["uri"] != CHECKPOINT:
-        raise ValueError(
-            "Golden manifest checkpoint does not match the pinned checkpoint"
-        )
-    if golden_manifest["files"]["arrays.npz"]["sha256"] != arrays_sha256:
-        raise ValueError("Downloaded golden arrays fail their retained SHA-256")
-    required_export_fields = {
-        "authoritative_weight_tree": "params",
-        "authoritative_weight_dtype": "float32",
-        "effective_weight_dtype": "bfloat16",
-        "global_device_count": 32,
-        "process_count": 32,
-        "golden_bundle": EXPORT_GOLDEN_ROOT,
-    }
-    for field, expected in required_export_fields.items():
-        if export_manifest.get(field) != expected:
-            raise ValueError(
-                f"Export manifest {field} is {export_manifest.get(field)!r}, "
-                f"expected {expected!r}"
-            )
     if export_manifest["checkpoint"]["uri"] != CHECKPOINT:
         raise ValueError(
             "Export manifest checkpoint does not match the pinned checkpoint"
         )
-    input_evidence = {
-        "golden_manifest_sha256": _sha256(golden_manifest_path),
-        "golden_arrays_sha256": arrays_sha256,
-        "golden_training_sequence_length": golden_manifest["model"]["resolved_config"][
-            "max_seq_len"
-        ],
+    if export_manifest.get("effective_weight_dtype") != "bfloat16":
+        raise ValueError("Export manifest is not an effective BF16 weight export")
+    input_evidence: dict[str, Any] = {
         "export_manifest_sha256": _sha256(export_manifest_path),
         "export_config_sha256": _sha256(config_dir / "config.json"),
         "export_eos_token_id": json.loads(
@@ -1303,6 +1419,42 @@ def main() -> None:
         "pending_qb_betas_sha256": export_manifest["pending_qb_betas_sha256"],
         "expert_tensor_layout": export_manifest["expert_tensor_layout"],
     }
+    if MODEL_ONLY_GSM8K == "0":
+        golden_manifest = json.loads(golden_manifest_path.read_text())
+        arrays_sha256 = _sha256(arrays_path)
+        if golden_manifest["asset_root"] != GOLDEN_ROOT:
+            raise ValueError(
+                "Golden manifest asset root does not match the pinned root"
+            )
+        if golden_manifest["checkpoint"]["uri"] != CHECKPOINT:
+            raise ValueError(
+                "Golden manifest checkpoint does not match the pinned checkpoint"
+            )
+        if golden_manifest["files"]["arrays.npz"]["sha256"] != arrays_sha256:
+            raise ValueError("Downloaded golden arrays fail their retained SHA-256")
+        required_export_fields = {
+            "authoritative_weight_tree": "params",
+            "authoritative_weight_dtype": "float32",
+            "effective_weight_dtype": "bfloat16",
+            "global_device_count": 32,
+            "process_count": 32,
+            "golden_bundle": EXPORT_GOLDEN_ROOT,
+        }
+        for field, expected in required_export_fields.items():
+            if export_manifest.get(field) != expected:
+                raise ValueError(
+                    f"Export manifest {field} is {export_manifest.get(field)!r}, "
+                    f"expected {expected!r}"
+                )
+        input_evidence.update(
+            {
+                "golden_manifest_sha256": _sha256(golden_manifest_path),
+                "golden_arrays_sha256": arrays_sha256,
+                "golden_training_sequence_length": golden_manifest["model"][
+                    "resolved_config"
+                ]["max_seq_len"],
+            }
+        )
     if GSM8K_PILOT == "1":
         pilot_inputs = json.loads(gsm8k_inputs_path.read_text())
         if len(pilot_inputs["records"]) < WORLD_SIZE:
@@ -1494,9 +1646,12 @@ def submit(iris_config: Path) -> None:
             environment=EnvironmentSpec(
                 env_vars={
                     "HERO_QUALIFICATION_REVISION": revision,
+                    "HERO_CHECKPOINT": CHECKPOINT,
+                    "HERO_WEIGHT_ROOT": WEIGHT_ROOT,
                     "HERO_PILOT": PILOT,
                     "HERO_RL_ROLLOUT": RL_ROLLOUT,
                     "HERO_GSM8K_PILOT": GSM8K_PILOT,
+                    "HERO_MODEL_ONLY_GSM8K": MODEL_ONLY_GSM8K,
                     "HERO_NATURAL_TRACE": NATURAL_TRACE,
                     "HERO_NUMERIC_PAD_KV_ROWS": str(PAD_KV_ROWS),
                     "HERO_NUMERIC_KV_HISTORY": KV_HISTORY,
