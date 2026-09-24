@@ -1239,6 +1239,9 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         self._numeric_trace_token = int(
             os.environ.get("HERO_NUMERIC_TRACE_TOKEN", "-1")
         )
+        self._numeric_trace_prefill = (
+            os.environ.get("HERO_NUMERIC_TRACE_PREFILL") == "1"
+        )
         self._numeric_trace_row: int | None = None
         self._numeric_trace_arrays: dict[str, np.ndarray] | None = None
         self._numeric_history_enabled = (
@@ -1388,7 +1391,11 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             raise ValueError(f"Unknown numeric trace mode {mode!r}")
         # Decode requests also prefill their prompts. Capture the generated
         # token's one-row forward pass, not a matching row in that prefill.
-        if mode in {"decode", "sample"} and input_ids.numel() != 1:
+        if (
+            mode in {"decode", "sample"}
+            and not self._numeric_trace_prefill
+            and input_ids.numel() != 1
+        ):
             return None
         indices = torch.nonzero(
             positions == self._numeric_trace_position, as_tuple=False

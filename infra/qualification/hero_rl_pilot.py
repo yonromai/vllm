@@ -57,6 +57,7 @@ SAVED_STOP_ROOT = (
 NATURAL_TRACE = os.environ.get("HERO_NATURAL_TRACE", "0")
 PAD_KV_ROWS = int(os.environ.get("HERO_NUMERIC_PAD_KV_ROWS", "0"))
 KV_HISTORY = os.environ.get("HERO_NUMERIC_KV_HISTORY", "0")
+PREFILL_TRACE_POSITION = int(os.environ.get("HERO_PREFILL_TRACE_POSITION", "-1"))
 TRACE_TARGETS = {
     8: (1860, 102473, 1667),
     17: (3692, 4777, 3524),
@@ -90,6 +91,10 @@ if PAD_KV_ROWS < 0:
     raise ValueError("HERO_NUMERIC_PAD_KV_ROWS must be nonnegative")
 if KV_HISTORY not in {"0", "1"} or (KV_HISTORY == "1" and NATURAL_TRACE == "0"):
     raise ValueError("HERO_NUMERIC_KV_HISTORY requires a natural or forced trace")
+if PREFILL_TRACE_POSITION < -1 or (
+    PREFILL_TRACE_POSITION >= 0 and NATURAL_TRACE == "0"
+):
+    raise ValueError("HERO_PREFILL_TRACE_POSITION requires a natural or forced trace")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -437,6 +442,15 @@ def _run_rank(
     trace_arm = Path(output_path).with_suffix(".numeric-arm")
     if NATURAL_TRACE != "0" and global_rank in TRACE_TARGETS:
         trace_position, trace_input_token, _ = TRACE_TARGETS[global_rank]
+        if PREFILL_TRACE_POSITION >= 0:
+            assert gsm8k_inputs_path is not None
+            pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
+            prompt_ids = pilot_inputs["records"][global_rank]["hero_prompt_token_ids"]
+            if len(prompt_ids) <= PREFILL_TRACE_POSITION:
+                raise ValueError("Prefill trace position is outside the prompt")
+            trace_position = PREFILL_TRACE_POSITION
+            trace_input_token = prompt_ids[trace_position]
+            os.environ["HERO_NUMERIC_TRACE_PREFILL"] = "1"
         os.environ.update(
             {
                 "HERO_NUMERIC_TRACE_ROOT": str(trace_root),
@@ -554,6 +568,7 @@ def _run_rank(
             "trace_position": TRACE_TARGETS[global_rank][0]
             if global_rank in TRACE_TARGETS
             else None,
+            "prefill_trace_position": PREFILL_TRACE_POSITION,
         }
         if NATURAL_TRACE == "2":
             decode_routes = rollout.routed_experts
@@ -1413,6 +1428,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_NATURAL_TRACE": NATURAL_TRACE,
                     "HERO_NUMERIC_PAD_KV_ROWS": str(PAD_KV_ROWS),
                     "HERO_NUMERIC_KV_HISTORY": KV_HISTORY,
+                    "HERO_PREFILL_TRACE_POSITION": str(PREFILL_TRACE_POSITION),
                     "HERO_GSM8K_INPUT_URI": GSM8K_INPUT_URI,
                     "HERO_GSM8K_INPUT_SHA256": GSM8K_INPUT_SHA256,
                     "HERO_HARDWARE": HARDWARE,
