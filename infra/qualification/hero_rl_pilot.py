@@ -58,6 +58,7 @@ NATURAL_TRACE = os.environ.get("HERO_NATURAL_TRACE", "0")
 PAD_KV_ROWS = int(os.environ.get("HERO_NUMERIC_PAD_KV_ROWS", "0"))
 KV_HISTORY = os.environ.get("HERO_NUMERIC_KV_HISTORY", "0")
 PREFILL_TRACE_POSITION = int(os.environ.get("HERO_PREFILL_TRACE_POSITION", "-1"))
+PREFILL_ONLY_TRACE = os.environ.get("HERO_PREFILL_ONLY_TRACE", "0")
 TRACE_TARGETS = {
     8: (1860, 102473, 1667),
     17: (3692, 4777, 3524),
@@ -95,6 +96,11 @@ if PREFILL_TRACE_POSITION < -1 or (
     PREFILL_TRACE_POSITION >= 0 and NATURAL_TRACE == "0"
 ):
     raise ValueError("HERO_PREFILL_TRACE_POSITION requires a natural or forced trace")
+if PREFILL_ONLY_TRACE not in {"0", "1"} or (
+    PREFILL_ONLY_TRACE == "1"
+    and (NATURAL_TRACE != "2" or PREFILL_TRACE_POSITION < 0)
+):
+    raise ValueError("HERO_PREFILL_ONLY_TRACE requires forced prefill tracing")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -505,6 +511,72 @@ def _run_rank(
         saved_response = saved["response_token_ids"]
         if prompt_ids != saved["prompt_token_ids"]:
             raise ValueError(f"Saved prompt differs at rank {global_rank}")
+        if PREFILL_ONLY_TRACE == "1":
+            short_start = time.monotonic()
+            short = llm.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                SamplingParams(
+                    max_tokens=1,
+                    temperature=0,
+                    prompt_logprobs=1,
+                    detokenize=False,
+                    ignore_eos=True,
+                ),
+                use_tqdm=False,
+            )[0]
+            short_seconds = time.monotonic() - short_start
+            if global_rank in TRACE_TARGETS:
+                trace_arm.write_text("full\n")
+            full_ids = (prompt_ids + saved_response)[:MAX_BATCHED_TOKENS]
+            full_start = time.monotonic()
+            full = llm.generate(
+                [{"prompt_token_ids": full_ids}],
+                SamplingParams(
+                    max_tokens=1,
+                    temperature=0,
+                    prompt_logprobs=1,
+                    detokenize=False,
+                    ignore_eos=True,
+                ),
+                use_tqdm=False,
+            )[0]
+            full_seconds = time.monotonic() - full_start
+            short_routes = short.outputs[0].routed_experts
+            full_routes = full.outputs[0].routed_experts
+            if short_routes is None or full_routes is None:
+                raise ValueError("Prefill-only trace requires both route arrays")
+            route_path = Path(output_path).with_suffix(".numeric.routes.npz")
+            np.savez_compressed(
+                route_path,
+                decode_routes=short_routes.astype(np.int16),
+                prefill_routes=full_routes.astype(np.int16),
+            )
+            result = {
+                "rank": global_rank,
+                "checkpoint": CHECKPOINT,
+                "weight_root": WEIGHT_ROOT,
+                "source_revision": os.environ["HERO_QUALIFICATION_REVISION"],
+                "saved_capture_uri": saved_uri,
+                "saved_capture_sha256": _sha256(saved_path),
+                "prefill_only_trace": True,
+                "prefill_trace_position": PREFILL_TRACE_POSITION,
+                "short_prompt_tokens": len(prompt_ids),
+                "full_prefix_tokens": len(full_ids),
+                "short_seconds": short_seconds,
+                "full_seconds": full_seconds,
+                "short_routes_shape": list(short_routes.shape),
+                "full_routes_shape": list(full_routes.shape),
+                "route_trace_sha256": _sha256(route_path),
+            }
+            if global_rank in TRACE_TARGETS:
+                result["sample_trace_sha256"] = _sha256(
+                    Path(f"{trace_root}.sample.npz")
+                )
+                result["full_trace_sha256"] = _sha256(
+                    Path(f"{trace_root}.full.npz")
+                )
+            Path(output_path).write_text(json.dumps(result, sort_keys=True))
+            return
         if NATURAL_TRACE == "1":
             decode_params = SamplingParams(
                 max_tokens=CONTEXT_LIMIT - len(prompt_ids),
@@ -1429,6 +1501,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_NUMERIC_PAD_KV_ROWS": str(PAD_KV_ROWS),
                     "HERO_NUMERIC_KV_HISTORY": KV_HISTORY,
                     "HERO_PREFILL_TRACE_POSITION": str(PREFILL_TRACE_POSITION),
+                    "HERO_PREFILL_ONLY_TRACE": PREFILL_ONLY_TRACE,
                     "HERO_GSM8K_INPUT_URI": GSM8K_INPUT_URI,
                     "HERO_GSM8K_INPUT_SHA256": GSM8K_INPUT_SHA256,
                     "HERO_HARDWARE": HARDWARE,
