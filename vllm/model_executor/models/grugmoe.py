@@ -1363,8 +1363,13 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         if bool((positions == self._numeric_trace_position).any()):
             arrays = {name: np.concatenate(chunks) for name, chunks in rows.items()}
             expected = np.arange(self._numeric_trace_position + 1)
-            if not np.array_equal(arrays["positions"], expected):
-                raise ValueError("Numeric KV history is not a complete prefix")
+            unique, counts = np.unique(arrays["positions"], return_counts=True)
+            missing = np.setdiff1d(expected, unique)
+            arrays["missing_positions"] = missing
+            arrays["duplicate_positions"] = unique[counts > 1]
+            arrays["complete_ordered_prefix"] = np.array(
+                np.array_equal(arrays["positions"], expected)
+            )
             assert self._numeric_trace_root is not None
             path = Path(f"{self._numeric_trace_root}.{mode}.kv-history.npz")
             if path.exists():

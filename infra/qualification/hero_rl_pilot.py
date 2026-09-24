@@ -437,7 +437,6 @@ def _run_rank(
     trace_arm = Path(output_path).with_suffix(".numeric-arm")
     if NATURAL_TRACE != "0" and global_rank in TRACE_TARGETS:
         trace_position, trace_input_token, _ = TRACE_TARGETS[global_rank]
-        trace_arm.write_text("sample\n")
         os.environ.update(
             {
                 "HERO_NUMERIC_TRACE_ROOT": str(trace_root),
@@ -477,6 +476,10 @@ def _run_rank(
     )
 
     if NATURAL_TRACE != "0":
+        if global_rank in TRACE_TARGETS:
+            # Initialization profiles the model with synthetic tokens. Arm only
+            # after that profiling, so history files describe this request.
+            trace_arm.write_text("sample\n")
         assert gsm8k_inputs_path is not None
         pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
         record = pilot_inputs["records"][global_rank]
