@@ -41,11 +41,15 @@ WEIGHT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
     "hero-535b-step108000-bf16-split-v3"
 )
-GSM8K_INPUT_URI = (
+GSM8K_INPUT_URI = os.environ.get(
+    "HERO_GSM8K_INPUT_URI",
     "s3://marin-us-east-02a/marin/users/romain/hero-gsm8k-async-01a0cc2c/"
-    "inputs/train-0-31-v1.json"
+    "inputs/train-0-31-v1.json",
 )
-GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
+GSM8K_INPUT_SHA256 = os.environ.get(
+    "HERO_GSM8K_INPUT_SHA256",
+    "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4",
+)
 SAVED_STOP_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-4k-closure-01a0bca4/"
     "h100-eot-7755aaca7"
@@ -837,6 +841,9 @@ def _run_rank(
         np.savez_compressed(route_path, routed_experts=routes.astype(np.int16))
         gsm8k_capture = {
             "row_id": record["row_id"],
+            "group_id": record.get("group_id"),
+            "group_sample_index": record.get("group_sample_index"),
+            "source_rank": record.get("source_rank"),
             "ground_truth": record["ground_truth"],
             "prompt_token_ids": prompt_ids,
             "response_token_ids": response_ids,
@@ -1340,6 +1347,8 @@ def submit(iris_config: Path) -> None:
                     "HERO_GSM8K_PILOT": GSM8K_PILOT,
                     "HERO_NATURAL_TRACE": NATURAL_TRACE,
                     "HERO_NUMERIC_PAD_KV_ROWS": str(PAD_KV_ROWS),
+                    "HERO_GSM8K_INPUT_URI": GSM8K_INPUT_URI,
+                    "HERO_GSM8K_INPUT_SHA256": GSM8K_INPUT_SHA256,
                     "HERO_HARDWARE": HARDWARE,
                     "HERO_RESULT_ROOT": RESULT_ROOT,
                     "HERO_GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
