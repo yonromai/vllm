@@ -1405,10 +1405,18 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         if indices.numel() != 1:
             raise ValueError("Numeric trace position occurs more than once")
         row = int(indices.item())
-        if int(input_ids[row].item()) != self._numeric_trace_token:
-            raise ValueError("Numeric trace token does not match saved input")
         assert self._numeric_trace_root is not None
         path = Path(f"{self._numeric_trace_root}.{mode}.npz")
+        # The engine can execute synthetic decode batches between requests.
+        # At position zero they also match the traced position; ignore them,
+        # and disarm this mode once its real trace has been saved.
+        if self._numeric_trace_prefill and self._numeric_trace_position == 0:
+            if path.exists():
+                return None
+            if int(input_ids[row].item()) != self._numeric_trace_token:
+                return None
+        if int(input_ids[row].item()) != self._numeric_trace_token:
+            raise ValueError("Numeric trace token does not match saved input")
         if path.exists():
             raise ValueError(f"Duplicate numeric trace {path}")
         self._numeric_trace_row = row
