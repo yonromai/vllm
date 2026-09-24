@@ -549,6 +549,43 @@ def _run_rank(
             if global_rank in TRACE_TARGETS
             else None,
         }
+        if NATURAL_TRACE == "2":
+            decode_routes = rollout.routed_experts
+            prefill_routes = prefill.outputs[0].routed_experts
+            if decode_routes is None or prefill_routes is None:
+                raise ValueError("Forced replay requires both route arrays")
+            route_path = Path(output_path).with_suffix(".numeric.routes.npz")
+            np.savez_compressed(
+                route_path,
+                decode_routes=decode_routes.astype(np.int16),
+                prefill_routes=prefill_routes.astype(np.int16),
+            )
+            result.update(
+                {
+                    "decode_logprobs": [
+                        float(entries[token].logprob)
+                        for entries, token in zip(
+                            rollout.logprobs, saved_response, strict=True
+                        )
+                    ],
+                    "prefill_logprobs": [
+                        float(entries[token].logprob)
+                        for entries, token in zip(
+                            prefill.prompt_logprobs[
+                                len(prompt_ids) : len(trajectory_ids)
+                            ],
+                            saved_response,
+                            strict=True,
+                        )
+                    ],
+                    "route_trace_uri": (
+                        f"{RESULT_ROOT}/rank-{global_rank}.numeric.routes.npz"
+                    ),
+                    "route_trace_sha256": _sha256(route_path),
+                    "decode_routes_shape": list(decode_routes.shape),
+                    "prefill_routes_shape": list(prefill_routes.shape),
+                }
+            )
         if global_rank in TRACE_TARGETS:
             trace_position, trace_input_token, response_index = TRACE_TARGETS[
                 global_rank
@@ -1234,6 +1271,7 @@ def main() -> None:
                     output_path,
                     output_path.with_suffix(".numeric.sample.npz"),
                     output_path.with_suffix(".numeric.full.npz"),
+                    output_path.with_suffix(".numeric.routes.npz"),
                 ):
                     if path.exists():
                         uri = f"{RESULT_ROOT}/{path.name}"
@@ -1280,6 +1318,12 @@ def main() -> None:
                 bucket, key = _s3_parts(trace_uri)
                 client.upload_file(str(trace_path), bucket, key)
                 print(f"uploaded {trace_uri}", flush=True)
+        if NATURAL_TRACE == "2":
+            route_path = output_path.with_suffix(".numeric.routes.npz")
+            route_uri = f"{RESULT_ROOT}/rank-{global_rank}.numeric.routes.npz"
+            bucket, key = _s3_parts(route_uri)
+            client.upload_file(str(route_path), bucket, key)
+            print(f"uploaded {route_uri}", flush=True)
 
 
 def submit(iris_config: Path) -> None:
