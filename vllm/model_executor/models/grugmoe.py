@@ -1241,6 +1241,13 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         )
         self._numeric_trace_row: int | None = None
         self._numeric_trace_arrays: dict[str, np.ndarray] | None = None
+        self._numeric_history_enabled = (
+            self._numeric_trace_root is not None
+            and os.environ.get("HERO_NUMERIC_KV_HISTORY") == "1"
+        )
+        self._numeric_history_mode: str | None = None
+        self._numeric_history_positions: torch.Tensor | None = None
+        self._numeric_history_rows: dict[str, list[np.ndarray]] = {}
         if self._numeric_trace_root is not None:
             self._install_numeric_trace_hooks()
 
@@ -1333,6 +1340,37 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         attention.rotary_emb.register_forward_hook(
             lambda _module, _args, output: self._capture_numeric_rotary(output)
         )
+        if self._numeric_history_enabled:
+            attention.attn.register_forward_pre_hook(self._capture_numeric_kv_history)
+
+    def _capture_numeric_kv_history(
+        self, _module: nn.Module, args: tuple[torch.Tensor, ...]
+    ) -> None:
+        mode = self._numeric_history_mode
+        positions = self._numeric_history_positions
+        if mode is None or positions is None:
+            return
+        selected = positions <= self._numeric_trace_position
+        if not bool(selected.any()):
+            return
+        rows = self._numeric_history_rows
+        rows.setdefault("positions", []).append(positions[selected].cpu().numpy())
+        for name, value in (("key", args[1]), ("value", args[2])):
+            # Store BF16 bits, preserving exact cache inputs without a float32 cast.
+            rows.setdefault(name, []).append(
+                value[selected].detach().contiguous().view(torch.int16).cpu().numpy()
+            )
+        if bool((positions == self._numeric_trace_position).any()):
+            arrays = {name: np.concatenate(chunks) for name, chunks in rows.items()}
+            expected = np.arange(self._numeric_trace_position + 1)
+            if not np.array_equal(arrays["positions"], expected):
+                raise ValueError("Numeric KV history is not a complete prefix")
+            assert self._numeric_trace_root is not None
+            path = Path(f"{self._numeric_trace_root}.{mode}.kv-history.npz")
+            if path.exists():
+                raise ValueError(f"Duplicate numeric KV history {path}")
+            np.savez_compressed(path, **arrays)
+            self._numeric_history_rows = {}
 
     def _numeric_trace_mode(
         self, input_ids: torch.Tensor | None, positions: torch.Tensor
@@ -1382,6 +1420,20 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         trace_mode = self._numeric_trace_mode(input_ids, positions)
+        self._numeric_history_mode = None
+        self._numeric_history_positions = None
+        if (
+            self._numeric_history_enabled
+            and self._numeric_trace_arm is not None
+            and self._numeric_trace_arm.exists()
+        ):
+            mode = self._numeric_trace_arm.read_text().strip()
+            if (
+                mode in {"sample", "full"}
+                and int(positions[0].item()) <= self._numeric_trace_position
+            ):
+                self._numeric_history_mode = mode
+                self._numeric_history_positions = positions
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

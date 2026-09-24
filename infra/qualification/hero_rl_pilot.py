@@ -56,6 +56,7 @@ SAVED_STOP_ROOT = (
 )
 NATURAL_TRACE = os.environ.get("HERO_NATURAL_TRACE", "0")
 PAD_KV_ROWS = int(os.environ.get("HERO_NUMERIC_PAD_KV_ROWS", "0"))
+KV_HISTORY = os.environ.get("HERO_NUMERIC_KV_HISTORY", "0")
 TRACE_TARGETS = {
     8: (1860, 102473, 1667),
     17: (3692, 4777, 3524),
@@ -87,6 +88,8 @@ if NATURAL_TRACE not in {"0", "1", "2"} or (
     raise ValueError("HERO_NATURAL_TRACE requires HERO_GSM8K_PILOT=1")
 if PAD_KV_ROWS < 0:
     raise ValueError("HERO_NUMERIC_PAD_KV_ROWS must be nonnegative")
+if KV_HISTORY not in {"0", "1"} or (KV_HISTORY == "1" and NATURAL_TRACE == "0"):
+    raise ValueError("HERO_NUMERIC_KV_HISTORY requires a natural or forced trace")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -615,6 +618,11 @@ def _run_rank(
                     "full_trace_sha256": _sha256(Path(f"{trace_root}.full.npz")),
                 }
             )
+            if KV_HISTORY == "1":
+                result["kv_history_sha256"] = {
+                    mode: _sha256(Path(f"{trace_root}.{mode}.kv-history.npz"))
+                    for mode in ("sample", "full")
+                }
             if NATURAL_TRACE == "1":
                 result["sample_score"] = sample_score
                 result["sample_route"] = result["decode_route"]
@@ -1272,6 +1280,8 @@ def main() -> None:
                     output_path.with_suffix(".numeric.sample.npz"),
                     output_path.with_suffix(".numeric.full.npz"),
                     output_path.with_suffix(".numeric.routes.npz"),
+                    output_path.with_suffix(".numeric.sample.kv-history.npz"),
+                    output_path.with_suffix(".numeric.full.kv-history.npz"),
                 ):
                     if path.exists():
                         uri = f"{RESULT_ROOT}/{path.name}"
@@ -1318,6 +1328,14 @@ def main() -> None:
                 bucket, key = _s3_parts(trace_uri)
                 client.upload_file(str(trace_path), bucket, key)
                 print(f"uploaded {trace_uri}", flush=True)
+                if KV_HISTORY == "1":
+                    history_path = output_path.with_suffix(
+                        f".numeric.{mode}.kv-history.npz"
+                    )
+                    history_uri = f"{RESULT_ROOT}/{history_path.name}"
+                    bucket, key = _s3_parts(history_uri)
+                    client.upload_file(str(history_path), bucket, key)
+                    print(f"uploaded {history_uri}", flush=True)
         if NATURAL_TRACE == "2":
             route_path = output_path.with_suffix(".numeric.routes.npz")
             route_uri = f"{RESULT_ROOT}/rank-{global_rank}.numeric.routes.npz"
@@ -1391,6 +1409,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_GSM8K_PILOT": GSM8K_PILOT,
                     "HERO_NATURAL_TRACE": NATURAL_TRACE,
                     "HERO_NUMERIC_PAD_KV_ROWS": str(PAD_KV_ROWS),
+                    "HERO_NUMERIC_KV_HISTORY": KV_HISTORY,
                     "HERO_GSM8K_INPUT_URI": GSM8K_INPUT_URI,
                     "HERO_GSM8K_INPUT_SHA256": GSM8K_INPUT_SHA256,
                     "HERO_HARDWARE": HARDWARE,
