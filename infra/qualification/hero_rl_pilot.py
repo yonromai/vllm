@@ -61,6 +61,9 @@ PAD_KV_ROWS = int(os.environ.get("HERO_NUMERIC_PAD_KV_ROWS", "0"))
 KV_HISTORY = os.environ.get("HERO_NUMERIC_KV_HISTORY", "0")
 PREFILL_TRACE_POSITION = int(os.environ.get("HERO_PREFILL_TRACE_POSITION", "-1"))
 PREFILL_ONLY_TRACE = os.environ.get("HERO_PREFILL_ONLY_TRACE", "0")
+BATCH_INVARIANT = os.environ.get("VLLM_BATCH_INVARIANT", "0")
+if BATCH_INVARIANT not in {"0", "1"}:
+    raise ValueError("VLLM_BATCH_INVARIANT must be 0 or 1")
 TRACE_TARGETS = {
     8: (1860, 102473, 1667),
     17: (3692, 4777, 3524),
@@ -1670,6 +1673,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_NUMERIC_KV_HISTORY": KV_HISTORY,
                     "HERO_PREFILL_TRACE_POSITION": str(PREFILL_TRACE_POSITION),
                     "HERO_PREFILL_ONLY_TRACE": PREFILL_ONLY_TRACE,
+                    "VLLM_BATCH_INVARIANT": BATCH_INVARIANT,
                     "HERO_GSM8K_INPUT_URI": GSM8K_INPUT_URI,
                     "HERO_GSM8K_INPUT_SHA256": GSM8K_INPUT_SHA256,
                     "HERO_HARDWARE": HARDWARE,
