@@ -1690,7 +1690,9 @@ def submit(iris_config: Path) -> None:
             max_retries_failure=0,
             max_retries_preemption=0,
             max_task_failures=0,
-            priority_band=priority_band_value("interactive"),
+            priority_band=priority_band_value(
+                "production" if HARDWARE == "GB200" else "interactive"
+            ),
             existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
         )
     print(job.job_id)
