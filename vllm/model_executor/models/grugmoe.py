@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness-first GPU and TPU implementation of Marin GrugMoE."""
 
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1208,6 +1211,150 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.config.hidden_dim
         )
+        trace_root = os.environ.get("HERO_NUMERIC_TRACE_ROOT")
+        self._numeric_trace_root = Path(trace_root) if trace_root else None
+        self._numeric_trace_arm = (
+            Path(os.environ["HERO_NUMERIC_TRACE_ARM"])
+            if self._numeric_trace_root is not None
+            else None
+        )
+        self._numeric_trace_position = int(
+            os.environ.get("HERO_NUMERIC_TRACE_POSITION", "-1")
+        )
+        self._numeric_trace_token = int(
+            os.environ.get("HERO_NUMERIC_TRACE_TOKEN", "-1")
+        )
+        self._numeric_trace_row: int | None = None
+        self._numeric_trace_arrays: dict[str, np.ndarray] | None = None
+        if self._numeric_trace_root is not None:
+            self._install_numeric_trace_hooks()
+
+    def _capture_numeric_tensor(self, name: str, value: Any) -> None:
+        arrays = self._numeric_trace_arrays
+        row = self._numeric_trace_row
+        if arrays is None or row is None:
+            return
+        tensor = value[0] if isinstance(value, tuple) else value
+        arrays[name] = tensor[row].detach().float().cpu().numpy()
+
+    def _capture_numeric_rotary(
+        self, output: tuple[torch.Tensor, torch.Tensor]
+    ) -> None:
+        # get_rope caches one module shared by every layer. The first call in
+        # this forward pass belongs to layer 0; keep later calls from replacing it.
+        arrays = self._numeric_trace_arrays
+        if arrays is None or "layer_0_rotary_q" in arrays:
+            return
+        self._capture_numeric_tensor("layer_0_rotary_q", output[0])
+        self._capture_numeric_tensor("layer_0_rotary_k", output[1])
+
+    def _install_numeric_trace_hooks(self) -> None:
+        for name, module in (
+            ("embedding_lookup", self.embed_tokens),
+            ("embedding_norm", self.embed_norm),
+            ("model_input", self.embed_gated_norm),
+            ("final_norm", self.norm),
+            ("final_gated_norm", self.final_gated_norm),
+        ):
+            module.register_forward_hook(
+                lambda _module, _args, output, name=name: self._capture_numeric_tensor(
+                    name, output
+                )
+            )
+        for index in range(self.start_layer, self.end_layer):
+            layer = self.layers[index]
+            layer.register_forward_pre_hook(
+                lambda _module, args, index=index: self._capture_numeric_tensor(
+                    f"layer_{index}_input", args[1]
+                )
+            )
+            for name, module in (
+                ("attention", layer.self_attn),
+                ("attention_short_conv", layer.sconv_attn),
+                ("mlp_input", layer.mlp_gated_norm),
+                ("router_logits", layer.mlp.router),
+                ("moe_output", layer.mlp),
+            ):
+                if module is None:
+                    continue
+                module.register_forward_hook(
+                    lambda _module, _args, output, index=index, name=name: (
+                        self._capture_numeric_tensor(f"layer_{index}_{name}", output)
+                    )
+                )
+            layer.register_forward_hook(
+                lambda _module, _args, output, index=index: (
+                    self._capture_numeric_tensor(f"layer_{index}_output", output)
+                )
+            )
+        attention = self.layers[self.start_layer].self_attn
+        first_layer = self.layers[self.start_layer]
+        for name, module in (
+            ("input_layernorm", first_layer.input_layernorm),
+            ("attention_gate_down", first_layer.attn_gated_norm.down_proj),
+            ("attention_gate_up", first_layer.attn_gated_norm.up_proj),
+            ("attention_input", first_layer.attn_gated_norm),
+        ):
+            module.register_forward_hook(
+                lambda _module, _args, output, name=name: self._capture_numeric_tensor(
+                    f"layer_0_{name}", output
+                )
+            )
+        for name, module in (
+            ("q_projection", attention.q_proj),
+            ("k_projection", attention.k_proj),
+            ("v_projection", attention.v_proj),
+            ("k_short_conv", attention.sconv_k),
+            ("attention_kernel", attention.attn),
+            ("attention_output_projection", attention.o_proj),
+        ):
+            if module is None:
+                continue
+            module.register_forward_hook(
+                lambda _module, _args, output, name=name: self._capture_numeric_tensor(
+                    f"layer_0_{name}", output
+                )
+            )
+        attention.rotary_emb.register_forward_hook(
+            lambda _module, _args, output: self._capture_numeric_rotary(output)
+        )
+
+    def _numeric_trace_mode(
+        self, input_ids: torch.Tensor | None, positions: torch.Tensor
+    ) -> str | None:
+        arm = self._numeric_trace_arm
+        if arm is None or not arm.exists() or input_ids is None:
+            return None
+        mode = arm.read_text().strip()
+        if mode not in {"short", "full", "decode", "sample"}:
+            raise ValueError(f"Unknown numeric trace mode {mode!r}")
+        # Decode requests also prefill their prompts. Capture the generated
+        # token's one-row forward pass, not a matching row in that prefill.
+        if mode in {"decode", "sample"} and input_ids.numel() != 1:
+            return None
+        indices = torch.nonzero(
+            positions == self._numeric_trace_position, as_tuple=False
+        ).flatten()
+        if indices.numel() == 0:
+            return None
+        if indices.numel() != 1:
+            raise ValueError("Numeric trace position occurs more than once")
+        row = int(indices.item())
+        if int(input_ids[row].item()) != self._numeric_trace_token:
+            raise ValueError("Numeric trace token does not match saved input")
+        assert self._numeric_trace_root is not None
+        path = Path(f"{self._numeric_trace_root}.{mode}.npz")
+        if path.exists():
+            raise ValueError(f"Duplicate numeric trace {path}")
+        self._numeric_trace_row = row
+        self._numeric_trace_arrays = {
+            "position": np.array(self._numeric_trace_position),
+            "token_id": np.array(self._numeric_trace_token),
+            "forward_tokens": np.array(input_ids.numel()),
+            "first_forward_position": np.array(int(positions[0].item())),
+            "last_forward_position": np.array(int(positions[-1].item())),
+        }
+        return mode
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1219,6 +1366,7 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        trace_mode = self._numeric_trace_mode(input_ids, positions)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1247,6 +1395,23 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
         hidden_states = self.final_gated_norm(self.norm(hidden_states))
+        if trace_mode is not None:
+            assert self._numeric_trace_root is not None
+            assert self._numeric_trace_arrays is not None
+            for layer_index in range(self.start_layer, self.end_layer):
+                self._numeric_trace_arrays[f"layer_{layer_index}_router_bias"] = (
+                    self.layers[layer_index]
+                    .mlp.router.bias.detach()
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+            np.savez_compressed(
+                f"{self._numeric_trace_root}.{trace_mode}.npz",
+                **self._numeric_trace_arrays,
+            )
+            self._numeric_trace_arrays = None
+            self._numeric_trace_row = None
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states

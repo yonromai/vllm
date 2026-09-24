@@ -46,6 +46,16 @@ GSM8K_INPUT_URI = (
     "inputs/train-0-31-v1.json"
 )
 GSM8K_INPUT_SHA256 = "5ea09a1a12757f00ab2a45bdd840a1dfadd5d378b4aeb8c3e8bb06b78a27ecd4"
+SAVED_STOP_ROOT = (
+    "s3://marin-us-east-02a/marin/users/romain/hero-4k-closure-01a0bca4/"
+    "h100-eot-7755aaca7"
+)
+NATURAL_TRACE = os.environ.get("HERO_NATURAL_TRACE", "0")
+TRACE_RANK = 15
+TRACE_POSITION = 238
+TRACE_INPUT_TOKEN = 400
+TRACE_RESPONSE_INDEX = 82
+TRACE_SAMPLE_LIMIT = 84
 CONTEXT_LIMIT = 4096
 MAX_MODEL_LEN = CONTEXT_LIMIT + 1
 # The pinned Marin tokenizer maps <|eot_id|> to 128009, but EOS to 128001.
@@ -67,6 +77,8 @@ if GSM8K_PILOT not in {"0", "1"} or (
     GSM8K_PILOT == "1" and (PILOT == "1" or RL_ROLLOUT == "1")
 ):
     raise ValueError("HERO_GSM8K_PILOT requires HERO_PILOT=0 and HERO_RL_ROLLOUT=0")
+if NATURAL_TRACE not in {"0", "1"} or (NATURAL_TRACE == "1" and GSM8K_PILOT != "1"):
+    raise ValueError("HERO_NATURAL_TRACE requires HERO_GSM8K_PILOT=1")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -410,6 +422,19 @@ def _run_rank(
             int(token) for token in arrays["tokens"][case_index, :prompt_length]
         ]
 
+    trace_root = Path(output_path).with_suffix(".numeric")
+    trace_arm = Path(output_path).with_suffix(".numeric-arm")
+    if NATURAL_TRACE == "1" and global_rank == TRACE_RANK:
+        trace_arm.write_text("sample\n")
+        os.environ.update(
+            {
+                "HERO_NUMERIC_TRACE_ROOT": str(trace_root),
+                "HERO_NUMERIC_TRACE_ARM": str(trace_arm),
+                "HERO_NUMERIC_TRACE_POSITION": str(TRACE_POSITION),
+                "HERO_NUMERIC_TRACE_TOKEN": str(TRACE_INPUT_TOKEN),
+            }
+        )
+
     llm = LLM(
         model=config_dir,
         model_weights=WEIGHT_ROOT,
@@ -438,6 +463,100 @@ def _run_rank(
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         disable_custom_all_reduce=True,
     )
+
+    if NATURAL_TRACE == "1":
+        assert gsm8k_inputs_path is not None
+        pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
+        record = pilot_inputs["records"][global_rank]
+        saved_path = Path(output_path).with_suffix(".saved.json")
+        saved_uri = f"{SAVED_STOP_ROOT}/rank-{global_rank}.json"
+        _download(_s3_client(), saved_uri, saved_path)
+        saved = json.loads(saved_path.read_text())["gsm8k_pilot"]
+        prompt_ids = record["hero_prompt_token_ids"]
+        saved_response = saved["response_token_ids"]
+        if prompt_ids != saved["prompt_token_ids"]:
+            raise ValueError(f"Saved prompt differs at rank {global_rank}")
+        rollout = llm.generate(
+            [{"prompt_token_ids": prompt_ids}],
+            SamplingParams(
+                max_tokens=min(TRACE_SAMPLE_LIMIT, CONTEXT_LIMIT - len(prompt_ids)),
+                temperature=1.0,
+                top_p=1.0,
+                logprobs=5,
+                detokenize=False,
+                seed=17 + global_rank,
+                stop_token_ids=[HERO_TURN_END_TOKEN_ID],
+            ),
+            use_tqdm=False,
+        )[0].outputs[0]
+        response_ids = [int(token) for token in rollout.token_ids]
+        if response_ids != saved_response[: len(response_ids)]:
+            raise ValueError(f"Sampled prefix differs at rank {global_rank}")
+        if len(response_ids) != min(TRACE_SAMPLE_LIMIT, len(saved_response)):
+            raise ValueError(f"Sampled response length differs at rank {global_rank}")
+        if global_rank == TRACE_RANK:
+            trace_arm.write_text("full\n")
+        trajectory_ids = prompt_ids + saved_response
+        prefill = llm.generate(
+            [{"prompt_token_ids": trajectory_ids}],
+            SamplingParams(
+                max_tokens=1,
+                temperature=0,
+                prompt_logprobs=1,
+                detokenize=False,
+                ignore_eos=True,
+            ),
+            use_tqdm=False,
+        )[0]
+        result: dict[str, Any] = {
+            "rank": global_rank,
+            "checkpoint": CHECKPOINT,
+            "weight_root": WEIGHT_ROOT,
+            "source_revision": os.environ["HERO_QUALIFICATION_REVISION"],
+            "saved_capture_uri": saved_uri,
+            "saved_capture_sha256": _sha256(saved_path),
+            "sampled_prefix_matches": True,
+            "sampled_tokens": len(response_ids),
+            "prefill_tokens": len(trajectory_ids),
+            "trace_position": TRACE_POSITION,
+        }
+        if global_rank == TRACE_RANK:
+            if trajectory_ids[TRACE_POSITION] != TRACE_INPUT_TOKEN:
+                raise ValueError("Saved trace input token differs")
+            target_token = saved_response[TRACE_RESPONSE_INDEX]
+            sample_entry = rollout.logprobs[TRACE_RESPONSE_INDEX][target_token]
+            sample_score = float(sample_entry.logprob)
+            prefill_entry = prefill.prompt_logprobs[
+                len(prompt_ids) + TRACE_RESPONSE_INDEX
+            ][target_token]
+            prefill_score = float(
+                prefill_entry.logprob
+            )
+            sample_routes = rollout.routed_experts
+            prefill_routes = prefill.outputs[0].routed_experts
+            if sample_routes is None or prefill_routes is None:
+                raise ValueError("Missing routed experts in natural trace")
+            result.update(
+                {
+                    "target_token": target_token,
+                    "sample_score": sample_score,
+                    "saved_sample_score": saved["response_logprobs"][
+                        TRACE_RESPONSE_INDEX
+                    ],
+                    "prefill_score": prefill_score,
+                    "sample_route": sample_routes[TRACE_POSITION].tolist(),
+                    "prefill_route": prefill_routes[TRACE_POSITION].tolist(),
+                    "sample_trace_sha256": _sha256(Path(f"{trace_root}.sample.npz")),
+                    "full_trace_sha256": _sha256(Path(f"{trace_root}.full.npz")),
+                }
+            )
+            trace_arm.unlink()
+        Path(output_path).write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n"
+        )
+        _wait_for_all_ranks(_s3_client(), global_rank)
+        llm.llm_engine.engine_core.shutdown()
+        return
 
     if RL_ROLLOUT == "1":
         rollout = llm.generate(
@@ -1103,12 +1222,19 @@ def main() -> None:
             bucket, key = _s3_parts(route_uri)
             client.upload_file(str(route_path), bucket, key)
             print(f"uploaded {route_uri}", flush=True)
-        if GSM8K_PILOT == "1":
+        if GSM8K_PILOT == "1" and NATURAL_TRACE == "0":
             route_path = output_path.with_suffix(".gsm8k.routes.npz")
             route_uri = f"{RESULT_ROOT}/rank-{global_rank}.gsm8k.routes.npz"
             bucket, key = _s3_parts(route_uri)
             client.upload_file(str(route_path), bucket, key)
             print(f"uploaded {route_uri}", flush=True)
+        if NATURAL_TRACE == "1" and global_rank == TRACE_RANK:
+            for mode in ("sample", "full"):
+                trace_path = output_path.with_suffix(f".numeric.{mode}.npz")
+                trace_uri = f"{RESULT_ROOT}/rank-{global_rank}.numeric.{mode}.npz"
+                bucket, key = _s3_parts(trace_uri)
+                client.upload_file(str(trace_path), bucket, key)
+                print(f"uploaded {trace_uri}", flush=True)
 
 
 def submit(iris_config: Path) -> None:
@@ -1174,6 +1300,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_PILOT": PILOT,
                     "HERO_RL_ROLLOUT": RL_ROLLOUT,
                     "HERO_GSM8K_PILOT": GSM8K_PILOT,
+                    "HERO_NATURAL_TRACE": NATURAL_TRACE,
                     "HERO_HARDWARE": HARDWARE,
                     "HERO_RESULT_ROOT": RESULT_ROOT,
                     "HERO_GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
