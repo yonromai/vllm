@@ -892,6 +892,11 @@ class GrugMoeAttention(nn.Module):
         self.use_rope = use_rope
         self.logical_kv_heads = cfg.logical_kv_heads(is_global=is_global)
         self.qk_mult_scale = qk_mult_scale
+        self._numeric_pad_kv_rows = int(os.environ.get("HERO_NUMERIC_PAD_KV_ROWS", "0"))
+        if self._numeric_pad_kv_rows < 0:
+            raise ValueError("HERO_NUMERIC_PAD_KV_ROWS must be nonnegative")
+        if self._numeric_pad_kv_rows and quant_config is not None:
+            raise ValueError("Numerical key/value padding requires unquantized weights")
 
         self.q_proj = ReplicatedLinear(
             cfg.hidden_dim,
@@ -997,12 +1002,22 @@ class GrugMoeAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        if 0 < num_tokens < self._numeric_pad_kv_rows:
+            padded = F.pad(
+                hidden_states,
+                (0, 0, 0, self._numeric_pad_kv_rows - num_tokens),
+            )
+            k, _ = self.k_proj(padded)
+            v, _ = self.v_proj(padded)
+            k = k[:num_tokens]
+            v = v[:num_tokens]
+        else:
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
         if self.sconv_k is not None:
             k = self.sconv_k(k)
 
-        num_tokens = hidden_states.shape[0]
         q = _rms_norm(q.view(num_tokens, self.cfg.num_heads, self.head_dim))
         k = k.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)
         v = v.view(num_tokens, self.cfg.num_kv_heads, self.head_dim)

@@ -51,6 +51,7 @@ SAVED_STOP_ROOT = (
     "h100-eot-7755aaca7"
 )
 NATURAL_TRACE = os.environ.get("HERO_NATURAL_TRACE", "0")
+PAD_KV_ROWS = int(os.environ.get("HERO_NUMERIC_PAD_KV_ROWS", "0"))
 TRACE_TARGETS = {
     8: (1860, 102473, 1667),
     17: (3692, 4777, 3524),
@@ -76,8 +77,12 @@ if GSM8K_PILOT not in {"0", "1"} or (
     GSM8K_PILOT == "1" and (PILOT == "1" or RL_ROLLOUT == "1")
 ):
     raise ValueError("HERO_GSM8K_PILOT requires HERO_PILOT=0 and HERO_RL_ROLLOUT=0")
-if NATURAL_TRACE not in {"0", "1"} or (NATURAL_TRACE == "1" and GSM8K_PILOT != "1"):
+if NATURAL_TRACE not in {"0", "1", "2"} or (
+    NATURAL_TRACE != "0" and GSM8K_PILOT != "1"
+):
     raise ValueError("HERO_NATURAL_TRACE requires HERO_GSM8K_PILOT=1")
+if PAD_KV_ROWS < 0:
+    raise ValueError("HERO_NUMERIC_PAD_KV_ROWS must be nonnegative")
 GPU_MEMORY_UTILIZATION = float(os.environ.get("HERO_GPU_MEMORY_UTILIZATION", "0.95"))
 if not 0 < GPU_MEMORY_UTILIZATION < 1:
     raise ValueError("HERO_GPU_MEMORY_UTILIZATION must be between 0 and 1")
@@ -423,7 +428,7 @@ def _run_rank(
 
     trace_root = Path(output_path).with_suffix(".numeric")
     trace_arm = Path(output_path).with_suffix(".numeric-arm")
-    if NATURAL_TRACE == "1" and global_rank in TRACE_TARGETS:
+    if NATURAL_TRACE != "0" and global_rank in TRACE_TARGETS:
         trace_position, trace_input_token, _ = TRACE_TARGETS[global_rank]
         trace_arm.write_text("sample\n")
         os.environ.update(
@@ -464,7 +469,7 @@ def _run_rank(
         disable_custom_all_reduce=True,
     )
 
-    if NATURAL_TRACE == "1":
+    if NATURAL_TRACE != "0":
         assert gsm8k_inputs_path is not None
         pilot_inputs = json.loads(Path(gsm8k_inputs_path).read_text())
         record = pilot_inputs["records"][global_rank]
@@ -476,9 +481,8 @@ def _run_rank(
         saved_response = saved["response_token_ids"]
         if prompt_ids != saved["prompt_token_ids"]:
             raise ValueError(f"Saved prompt differs at rank {global_rank}")
-        rollout = llm.generate(
-            [{"prompt_token_ids": prompt_ids}],
-            SamplingParams(
+        if NATURAL_TRACE == "1":
+            decode_params = SamplingParams(
                 max_tokens=CONTEXT_LIMIT - len(prompt_ids),
                 temperature=1.0,
                 top_p=1.0,
@@ -486,15 +490,30 @@ def _run_rank(
                 detokenize=False,
                 seed=17 + global_rank,
                 stop_token_ids=[HERO_TURN_END_TOKEN_ID],
-            ),
+            )
+        else:
+            decode_params = SamplingParams(
+                trace_decode_token_ids=saved_response,
+                max_tokens=len(saved_response),
+                temperature=0,
+                logprobs=5,
+                detokenize=False,
+                ignore_eos=True,
+            )
+        decode_start = time.monotonic()
+        rollout = llm.generate(
+            [{"prompt_token_ids": prompt_ids}],
+            decode_params,
             use_tqdm=False,
         )[0].outputs[0]
+        decode_seconds = time.monotonic() - decode_start
         response_ids = [int(token) for token in rollout.token_ids]
         if response_ids != saved_response:
-            raise ValueError(f"Sampled response differs at rank {global_rank}")
+            raise ValueError(f"Decoded response differs at rank {global_rank}")
         if global_rank in TRACE_TARGETS:
             trace_arm.write_text("full\n")
         trajectory_ids = prompt_ids + saved_response
+        prefill_start = time.monotonic()
         prefill = llm.generate(
             [{"prompt_token_ids": trajectory_ids}],
             SamplingParams(
@@ -506,6 +525,7 @@ def _run_rank(
             ),
             use_tqdm=False,
         )[0]
+        prefill_seconds = time.monotonic() - prefill_start
         result: dict[str, Any] = {
             "rank": global_rank,
             "checkpoint": CHECKPOINT,
@@ -513,9 +533,14 @@ def _run_rank(
             "source_revision": os.environ["HERO_QUALIFICATION_REVISION"],
             "saved_capture_uri": saved_uri,
             "saved_capture_sha256": _sha256(saved_path),
-            "sampled_prefix_matches": True,
-            "sampled_tokens": len(response_ids),
+            "decode_mode": "sampled" if NATURAL_TRACE == "1" else "forced_saved_ids",
+            "sampled_prefix_matches": True if NATURAL_TRACE == "1" else None,
+            "forced_response_matches_saved": NATURAL_TRACE == "2",
+            "decode_tokens": len(response_ids),
+            "decode_seconds": decode_seconds,
             "prefill_tokens": len(trajectory_ids),
+            "prefill_seconds": prefill_seconds,
+            "numeric_pad_kv_rows": PAD_KV_ROWS,
             "trace_position": TRACE_TARGETS[global_rank][0]
             if global_rank in TRACE_TARGETS
             else None,
@@ -540,15 +565,18 @@ def _run_rank(
             result.update(
                 {
                     "target_token": target_token,
-                    "sample_score": sample_score,
+                    "decode_score": sample_score,
                     "saved_sample_score": saved["response_logprobs"][response_index],
                     "prefill_score": prefill_score,
-                    "sample_route": sample_routes[trace_position].tolist(),
+                    "decode_route": sample_routes[trace_position].tolist(),
                     "prefill_route": prefill_routes[trace_position].tolist(),
                     "sample_trace_sha256": _sha256(Path(f"{trace_root}.sample.npz")),
                     "full_trace_sha256": _sha256(Path(f"{trace_root}.full.npz")),
                 }
             )
+            if NATURAL_TRACE == "1":
+                result["sample_score"] = sample_score
+                result["sample_route"] = result["decode_route"]
             trace_arm.unlink()
         Path(output_path).write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n"
@@ -1194,7 +1222,7 @@ def main() -> None:
         time.sleep(2)
     if failures:
         for global_rank, output_path, process in processes:
-            if NATURAL_TRACE == "1":
+            if NATURAL_TRACE != "0":
                 for path in (
                     output_path,
                     output_path.with_suffix(".numeric.sample.npz"),
@@ -1238,7 +1266,7 @@ def main() -> None:
             bucket, key = _s3_parts(route_uri)
             client.upload_file(str(route_path), bucket, key)
             print(f"uploaded {route_uri}", flush=True)
-        if NATURAL_TRACE == "1" and global_rank in TRACE_TARGETS:
+        if NATURAL_TRACE != "0" and global_rank in TRACE_TARGETS:
             for mode in ("sample", "full"):
                 trace_path = output_path.with_suffix(f".numeric.{mode}.npz")
                 trace_uri = f"{RESULT_ROOT}/rank-{global_rank}.numeric.{mode}.npz"
@@ -1311,6 +1339,7 @@ def submit(iris_config: Path) -> None:
                     "HERO_RL_ROLLOUT": RL_ROLLOUT,
                     "HERO_GSM8K_PILOT": GSM8K_PILOT,
                     "HERO_NATURAL_TRACE": NATURAL_TRACE,
+                    "HERO_NUMERIC_PAD_KV_ROWS": str(PAD_KV_ROWS),
                     "HERO_HARDWARE": HARDWARE,
                     "HERO_RESULT_ROOT": RESULT_ROOT,
                     "HERO_GPU_MEMORY_UTILIZATION": str(GPU_MEMORY_UTILIZATION),
