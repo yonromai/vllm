@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -24,6 +26,9 @@ from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+_HERO_NUMERIC_DETERMINISTIC_RS = os.environ.get(
+    "HERO_NUMERIC_DETERMINISTIC_RS", "0"
+) == "1"
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -515,14 +520,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # Symmetric memory is only used when all ranks have uniform sizes.
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
-        use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
+        use_symm_mem = (
+            sizes is None
+            and not _HERO_NUMERIC_DETERMINISTIC_RS
+            and should_nccl_symm_mem_ag_rs()
+        )
         if use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(
                 output_shape, dtype=input_tensor.dtype, device=input_tensor.device
             )
-            use_deterministic_rs = envs.VLLM_BATCH_INVARIANT and world_size > 2
+            use_deterministic_rs = (
+                envs.VLLM_BATCH_INVARIANT or _HERO_NUMERIC_DETERMINISTIC_RS
+            ) and world_size > 2
             if use_deterministic_rs:
                 # Reduce to a fixed root (0) for determinism
                 reduced = torch.empty_like(input_tensor)
