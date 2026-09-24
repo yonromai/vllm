@@ -17,7 +17,7 @@ from hero_rl_pilot import QUALIFICATION_SETUP
 
 TRACE_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-4k-numerical-01a0bca4/"
-    "h100-rank15-natural-trace-a8a2c3087"
+    "h100-clipped-natural-trace-aca4a44e1"
 )
 WEIGHT_URI = (
     "s3://marin-us-east-02a/marin/users/romain/hero-vllm-b200/"
@@ -25,11 +25,11 @@ WEIGHT_URI = (
 )
 RESULT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-4k-numerical-01a0bca4/"
-    "h100-rank15-key-gemm"
+    "h100-clipped-key-gemm"
 )
 WEIGHT_NAME = "model.layers.0.self_attn.k_proj.weight"
 WEIGHT_SHA256 = "6f64f41853be63e22fa85b9fd6c2bf329837fb2263b1417b46696d267b5e1e8c"
-CASES = ((15, "sample", "full"),)
+CASES = ((8, "sample", "full"), (17, "sample", "full"))
 
 
 def _s3_parts(uri: str) -> tuple[str, str]:
@@ -76,6 +76,8 @@ def run() -> None:
         .reshape(1536, 6144)
         .to("cuda")
     )
+    fp32_weight = weight.float()
+    torch.set_float32_matmul_precision("highest")
 
     rows = []
     for rank, left_mode, right_mode in CASES:
@@ -105,10 +107,22 @@ def run() -> None:
                 else:
                     batch[row] = x
                 output = F.linear(batch, weight)[row].float().cpu().numpy()
+                fp32_output = (
+                    F.linear(batch.float(), fp32_weight)[row]
+                    .to(torch.bfloat16)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
                 variants[fill] = {
                     "equal_elements": int(np.count_nonzero(output == observed)),
                     "max_abs_delta": float(np.max(np.abs(output - observed))),
                     "output": output,
+                    "fp32_equal_elements": int(
+                        np.count_nonzero(fp32_output == observed)
+                    ),
+                    "fp32_max_abs_delta": float(np.max(np.abs(fp32_output - observed))),
+                    "fp32_output": fp32_output,
                 }
             modes[mode] = {
                 "trace_uri": trace_uri,
@@ -143,7 +157,7 @@ def run() -> None:
                             fill: {
                                 key: value
                                 for key, value in variant.items()
-                                if key != "output"
+                                if key not in {"output", "fp32_output"}
                             }
                             for fill, variant in data["variants"].items()
                         }
@@ -162,6 +176,12 @@ def run() -> None:
                 "both_modes_exactly_reproduced": bool(
                     left["variants"]["zeros"]["equal_elements"] == 1536
                     and right["variants"]["zeros"]["equal_elements"] == 1536
+                ),
+                "fp32_modes_equal": bool(
+                    np.array_equal(
+                        left["variants"]["zeros"]["fp32_output"],
+                        right["variants"]["zeros"]["fp32_output"],
+                    )
                 ),
             }
         )
