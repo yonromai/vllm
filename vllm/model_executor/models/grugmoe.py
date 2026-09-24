@@ -1319,7 +1319,13 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
             ("attention_gate_down", first_layer.attn_gated_norm.down_proj),
             ("attention_gate_up", first_layer.attn_gated_norm.up_proj),
             ("attention_input", first_layer.attn_gated_norm),
+            ("latent_down_projection", first_layer.mlp.latent_down_proj),
+            ("latent_norm", first_layer.mlp.latent_norm),
+            ("fused_experts", first_layer.mlp.experts),
+            ("latent_up_projection", first_layer.mlp.latent_up_proj),
         ):
+            if module is None:
+                continue
             module.register_forward_hook(
                 lambda _module, _args, output, name=name: self._capture_numeric_tensor(
                     f"layer_0_{name}", output
