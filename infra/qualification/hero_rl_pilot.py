@@ -51,11 +51,10 @@ SAVED_STOP_ROOT = (
     "h100-eot-7755aaca7"
 )
 NATURAL_TRACE = os.environ.get("HERO_NATURAL_TRACE", "0")
-TRACE_RANK = 15
-TRACE_POSITION = 238
-TRACE_INPUT_TOKEN = 400
-TRACE_RESPONSE_INDEX = 82
-TRACE_SAMPLE_LIMIT = 84
+TRACE_TARGETS = {
+    8: (1860, 102473, 1667),
+    17: (3692, 4777, 3524),
+}
 CONTEXT_LIMIT = 4096
 MAX_MODEL_LEN = CONTEXT_LIMIT + 1
 # The pinned Marin tokenizer maps <|eot_id|> to 128009, but EOS to 128001.
@@ -424,14 +423,15 @@ def _run_rank(
 
     trace_root = Path(output_path).with_suffix(".numeric")
     trace_arm = Path(output_path).with_suffix(".numeric-arm")
-    if NATURAL_TRACE == "1" and global_rank == TRACE_RANK:
+    if NATURAL_TRACE == "1" and global_rank in TRACE_TARGETS:
+        trace_position, trace_input_token, _ = TRACE_TARGETS[global_rank]
         trace_arm.write_text("sample\n")
         os.environ.update(
             {
                 "HERO_NUMERIC_TRACE_ROOT": str(trace_root),
                 "HERO_NUMERIC_TRACE_ARM": str(trace_arm),
-                "HERO_NUMERIC_TRACE_POSITION": str(TRACE_POSITION),
-                "HERO_NUMERIC_TRACE_TOKEN": str(TRACE_INPUT_TOKEN),
+                "HERO_NUMERIC_TRACE_POSITION": str(trace_position),
+                "HERO_NUMERIC_TRACE_TOKEN": str(trace_input_token),
             }
         )
 
@@ -479,7 +479,7 @@ def _run_rank(
         rollout = llm.generate(
             [{"prompt_token_ids": prompt_ids}],
             SamplingParams(
-                max_tokens=min(TRACE_SAMPLE_LIMIT, CONTEXT_LIMIT - len(prompt_ids)),
+                max_tokens=CONTEXT_LIMIT - len(prompt_ids),
                 temperature=1.0,
                 top_p=1.0,
                 logprobs=5,
@@ -490,11 +490,9 @@ def _run_rank(
             use_tqdm=False,
         )[0].outputs[0]
         response_ids = [int(token) for token in rollout.token_ids]
-        if response_ids != saved_response[: len(response_ids)]:
-            raise ValueError(f"Sampled prefix differs at rank {global_rank}")
-        if len(response_ids) != min(TRACE_SAMPLE_LIMIT, len(saved_response)):
-            raise ValueError(f"Sampled response length differs at rank {global_rank}")
-        if global_rank == TRACE_RANK:
+        if response_ids != saved_response:
+            raise ValueError(f"Sampled response differs at rank {global_rank}")
+        if global_rank in TRACE_TARGETS:
             trace_arm.write_text("full\n")
         trajectory_ids = prompt_ids + saved_response
         prefill = llm.generate(
@@ -518,20 +516,23 @@ def _run_rank(
             "sampled_prefix_matches": True,
             "sampled_tokens": len(response_ids),
             "prefill_tokens": len(trajectory_ids),
-            "trace_position": TRACE_POSITION,
+            "trace_position": TRACE_TARGETS[global_rank][0]
+            if global_rank in TRACE_TARGETS
+            else None,
         }
-        if global_rank == TRACE_RANK:
-            if trajectory_ids[TRACE_POSITION] != TRACE_INPUT_TOKEN:
+        if global_rank in TRACE_TARGETS:
+            trace_position, trace_input_token, response_index = TRACE_TARGETS[
+                global_rank
+            ]
+            if trajectory_ids[trace_position] != trace_input_token:
                 raise ValueError("Saved trace input token differs")
-            target_token = saved_response[TRACE_RESPONSE_INDEX]
-            sample_entry = rollout.logprobs[TRACE_RESPONSE_INDEX][target_token]
+            target_token = saved_response[response_index]
+            sample_entry = rollout.logprobs[response_index][target_token]
             sample_score = float(sample_entry.logprob)
             prefill_entry = prefill.prompt_logprobs[
-                len(prompt_ids) + TRACE_RESPONSE_INDEX
+                len(prompt_ids) + response_index
             ][target_token]
-            prefill_score = float(
-                prefill_entry.logprob
-            )
+            prefill_score = float(prefill_entry.logprob)
             sample_routes = rollout.routed_experts
             prefill_routes = prefill.outputs[0].routed_experts
             if sample_routes is None or prefill_routes is None:
@@ -540,12 +541,10 @@ def _run_rank(
                 {
                     "target_token": target_token,
                     "sample_score": sample_score,
-                    "saved_sample_score": saved["response_logprobs"][
-                        TRACE_RESPONSE_INDEX
-                    ],
+                    "saved_sample_score": saved["response_logprobs"][response_index],
                     "prefill_score": prefill_score,
-                    "sample_route": sample_routes[TRACE_POSITION].tolist(),
-                    "prefill_route": prefill_routes[TRACE_POSITION].tolist(),
+                    "sample_route": sample_routes[trace_position].tolist(),
+                    "prefill_route": prefill_routes[trace_position].tolist(),
                     "sample_trace_sha256": _sha256(Path(f"{trace_root}.sample.npz")),
                     "full_trace_sha256": _sha256(Path(f"{trace_root}.full.npz")),
                 }
@@ -1195,6 +1194,17 @@ def main() -> None:
         time.sleep(2)
     if failures:
         for global_rank, output_path, process in processes:
+            if NATURAL_TRACE == "1":
+                for path in (
+                    output_path,
+                    output_path.with_suffix(".numeric.sample.npz"),
+                    output_path.with_suffix(".numeric.full.npz"),
+                ):
+                    if path.exists():
+                        uri = f"{RESULT_ROOT}/{path.name}"
+                        bucket, key = _s3_parts(uri)
+                        client.upload_file(str(path), bucket, key)
+                        print(f"uploaded partial {uri}", flush=True)
             if GSM8K_PILOT == "1":
                 for suffix in (".gsm8k.partial.json", ".gsm8k.routes.npz"):
                     partial_path = output_path.with_suffix(suffix)
@@ -1228,7 +1238,7 @@ def main() -> None:
             bucket, key = _s3_parts(route_uri)
             client.upload_file(str(route_path), bucket, key)
             print(f"uploaded {route_uri}", flush=True)
-        if NATURAL_TRACE == "1" and global_rank == TRACE_RANK:
+        if NATURAL_TRACE == "1" and global_rank in TRACE_TARGETS:
             for mode in ("sample", "full"):
                 trace_path = output_path.with_suffix(f".numeric.{mode}.npz")
                 trace_uri = f"{RESULT_ROOT}/rank-{global_rank}.numeric.{mode}.npz"
