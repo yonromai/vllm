@@ -25,7 +25,7 @@ WEIGHT_URI = (
 )
 RESULT_ROOT = (
     "s3://marin-us-east-02a/marin/users/romain/hero-4k-numerical-01a0bca4/"
-    "h100-clipped-key-gemm"
+    "h100-clipped-key-gemm-shapes"
 )
 WEIGHT_NAME = "model.layers.0.self_attn.k_proj.weight"
 WEIGHT_SHA256 = "6f64f41853be63e22fa85b9fd6c2bf329837fb2263b1417b46696d267b5e1e8c"
@@ -142,6 +142,33 @@ def run() -> None:
         reproduced_different = (
             left["variants"]["zeros"]["output"] != right["variants"]["zeros"]["output"]
         )
+        fp32_left = left["variants"]["zeros"]["fp32_output"]
+        fp32_right = right["variants"]["zeros"]["fp32_output"]
+        fp32_difference = np.abs(fp32_left - fp32_right)
+        reference_sample = left["observed"]
+        reference_full = right["observed"]
+        input_row = torch.from_numpy(left["input_row"]).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        shape_sweep = []
+        for batch_size in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024):
+            batch = torch.zeros((batch_size, 6144), device="cuda", dtype=torch.bfloat16)
+            batch[0] = input_row
+            output = F.linear(batch, weight)[0].float().cpu().numpy()
+            shape_sweep.append(
+                {
+                    "batch_size": batch_size,
+                    "equal_sample_elements": int(
+                        np.count_nonzero(output == reference_sample)
+                    ),
+                    "equal_full_elements": int(
+                        np.count_nonzero(output == reference_full)
+                    ),
+                    "max_abs_delta_from_full": float(
+                        np.max(np.abs(output - reference_full))
+                    ),
+                }
+            )
         rows.append(
             {
                 "rank": rank,
@@ -178,11 +205,11 @@ def run() -> None:
                     and right["variants"]["zeros"]["equal_elements"] == 1536
                 ),
                 "fp32_modes_equal": bool(
-                    np.array_equal(
-                        left["variants"]["zeros"]["fp32_output"],
-                        right["variants"]["zeros"]["fp32_output"],
-                    )
+                    np.array_equal(fp32_left, fp32_right)
                 ),
+                "fp32_different_elements": int(np.count_nonzero(fp32_difference)),
+                "fp32_max_abs_delta": float(fp32_difference.max()),
+                "shape_sweep": shape_sweep,
             }
         )
     result = {
