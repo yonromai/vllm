@@ -1709,7 +1709,7 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
 )
 @pytest.mark.parametrize("num_tokens", [1, 7])
 @pytest.mark.parametrize("configuration", ["legacy", "online", "routed-experts-only"])
-def test_hero_online_fp8_latent_and_shared_experts_match_bf16(
+def test_hero_online_quantization_preserves_latent_and_shared_outputs(
     num_tokens, configuration, monkeypatch
 ):
     cfg = replace(
