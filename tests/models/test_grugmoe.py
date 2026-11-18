@@ -26,6 +26,7 @@ from vllm.config import (
 from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
@@ -36,6 +37,9 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 from vllm.model_executor.model_loader.reload.meta import materialize_layer
@@ -745,9 +749,15 @@ def _minimal_vllm_config_for_mode_check(
         None
         if quantization_method is None
         else (
-            Fp8Config(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
-            if quantization_method == "fp8"
-            else SimpleNamespace(get_name=lambda: quantization_method)
+            OnlineQuantizationConfig(
+                QuantizationConfigArgs(moe=quantization_method.removeprefix("online:"))
+            )
+            if quantization_method.startswith("online:")
+            else (
+                Fp8Config(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized)
+                if quantization_method == "fp8"
+                else SimpleNamespace(get_name=lambda: quantization_method)
+            )
         )
     )
     return SimpleNamespace(
@@ -785,6 +795,10 @@ def test_grug_moe_preserves_gpu_tensor_parallel_restriction(monkeypatch):
         (False, "unquantized", False, False),
         (False, "fp8", False, True),
         (False, "fp8", True, False),
+        (False, "online:fp8_per_tensor", False, True),
+        (False, "online:fp8_per_block", False, False),
+        (False, "online:fp8_per_channel", False, False),
+        (True, "online:fp8_per_tensor", False, False),
     ],
 )
 def test_grug_moe_quantization_platform_support(
@@ -1591,7 +1605,8 @@ def test_grug_moe_cuda_accepts_bf16_expert_weights(hero_profile):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
+@pytest.mark.parametrize("selective", [False, True])
+def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch, selective):
     cfg = replace(
         _tiny_config(),
         hidden_dim=64,
@@ -1609,7 +1624,11 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
         quantized = GrugMoeMLP(
             cfg,
             params_dtype=torch.bfloat16,
-            quant_config=Fp8Config(),
+            quant_config=(
+                OnlineQuantizationConfig(QuantizationConfigArgs(moe="fp8_per_tensor"))
+                if selective
+                else Fp8Config()
+            ),
             prefix="model.layers.0.mlp",
         )
         # Direct vLLM weights bypass Grug's checkpoint mapping.
@@ -1648,6 +1667,14 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
             )
         experts.quant_method.process_weights_after_loading(experts)
 
+    loaded = quantized.experts.routed_experts
+    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+        actual_weight, expected_weight = getattr(loaded, name), getattr(experts, name)
+        assert actual_weight.dtype == expected_weight.dtype
+        torch.testing.assert_close(
+            actual_weight.float(), expected_weight.float(), rtol=0, atol=0
+        )
+
     x = torch.linspace(-0.6, 0.7, 3 * cfg.hidden_dim, device="cuda").reshape(
         3, cfg.hidden_dim
     ).to(torch.bfloat16)
@@ -1681,7 +1708,10 @@ def test_grug_moe_online_fp8_loading_matches_vllm(monkeypatch):
     reason="requires CUDA with FP8 support",
 )
 @pytest.mark.parametrize("num_tokens", [1, 7])
-def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkeypatch):
+@pytest.mark.parametrize("configuration", ["legacy", "online", "experts-only"])
+def test_hero_online_fp8_latent_and_shared_experts_match_bf16(
+    num_tokens, configuration, monkeypatch
+):
     cfg = replace(
         _tiny_hero_config(),
         hidden_dim=128,
@@ -1696,7 +1726,17 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkey
     modules = []
     # Online loaders record the construction device and materialize weights there.
     with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
-        for profile, quant_config in (("reference", None), ("fp8", Fp8Config())):
+        selected_config = (
+            Fp8Config()
+            if configuration == "legacy"
+            else OnlineQuantizationConfig(
+                QuantizationConfigArgs(
+                    moe="fp8_per_tensor",
+                    linear="fp8_per_tensor" if configuration == "online" else None,
+                )
+            )
+        )
+        for profile, quant_config in (("reference", None), ("fp8", selected_config)):
             modules.append(
                 nn.ModuleDict(
                     {
@@ -1793,16 +1833,22 @@ def test_hero_online_fp8_latent_and_shared_experts_match_bf16(num_tokens, monkey
 
     assert quantized["mlp"].router.weight.dtype == torch.float32
     fp8_weights = [
-        quantized["mlp"].latent_down_proj.weight,
-        quantized["mlp"].latent_up_proj.weight,
         quantized["mlp"].experts.routed_experts.w13_weight,
         quantized["mlp"].experts.routed_experts.w2_weight,
     ]
+    projection_weights = [
+        quantized["mlp"].latent_down_proj.weight,
+        quantized["mlp"].latent_up_proj.weight,
+    ]
     for expert in quantized["shared_experts"]:
-        fp8_weights.extend(
+        projection_weights.extend(
             (expert.gate_proj.weight, expert.up_proj.weight, expert.down_proj.weight)
         )
     assert all(weight.dtype == torch.float8_e4m3fn for weight in fp8_weights)
+    projection_dtype = (
+        torch.bfloat16 if configuration == "experts-only" else torch.float8_e4m3fn
+    )
+    assert all(weight.dtype == projection_dtype for weight in projection_weights)
     torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
 
 

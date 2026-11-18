@@ -40,6 +40,12 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -661,7 +667,11 @@ class GrugMoeMLP(nn.Module):
             cfg.num_experts,
             bias=True,
             params_dtype=torch.float32,
-            quant_config=None if isinstance(quant_config, Fp8Config) else quant_config,
+            quant_config=(
+                None
+                if isinstance(quant_config, (Fp8Config, OnlineQuantizationConfig))
+                else quant_config
+            ),
             disable_tp=True,
             skip_bias_add=True,
             prefix=f"{prefix}.router",
@@ -1338,6 +1348,19 @@ class GrugMoeModel(nn.Module, EagleModelMixin):
         return hidden_states
 
 
+def _is_supported_online_fp8(quant_config: QuantizationConfig) -> bool:
+    if isinstance(quant_config, Fp8Config):
+        return not quant_config.is_checkpoint_fp8_serialized
+    if not isinstance(quant_config, OnlineQuantizationConfig):
+        return False
+    args = quant_config.args
+    return args.targets is None and all(
+        spec is None
+        or (spec.weight == kFp8StaticTensorSym and spec.activation is None)
+        for spec in (args.linear, args.moe)
+    )
+
+
 def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     is_tpu = current_platform.is_tpu()
@@ -1363,13 +1386,7 @@ def _raise_for_unsupported_modes(vllm_config: VllmConfig) -> None:
     quant_config = vllm_config.quant_config
     if quant_config is not None and (
         (is_tpu and quant_config.get_name() != _UNQUANTIZED_METHOD)
-        or (
-            not is_tpu
-            and (
-                not isinstance(quant_config, Fp8Config)
-                or quant_config.is_checkpoint_fp8_serialized
-            )
-        )
+        or (not is_tpu and not _is_supported_online_fp8(quant_config))
     ):
         raise NotImplementedError(
             "GrugMoE supports only online FP8 quantization on GPU "
