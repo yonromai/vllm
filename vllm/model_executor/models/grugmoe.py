@@ -13,6 +13,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -39,6 +40,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
@@ -715,6 +719,21 @@ class GrugMoeMLP(nn.Module):
             if cfg.latent_dim is not None
             else None
         )
+        moe_backend: MoEBackend | None = None
+        if (
+            isinstance(quant_config, OnlineQuantizationConfig)
+            and quant_config.args.moe is not None
+            and _is_supported_online_fp8(quant_config)
+            and get_current_vllm_config().kernel_config.moe_backend == "marlin"
+            and should_ignore_layer(
+                f"{prefix}.experts",
+                ignore=quant_config.ignored_layers,
+                fused_mapping=quant_config.packed_modules_mapping,
+                use_fnmatch=True,
+            )
+        ):
+            # Marlin's W8A16 kernel cannot consume BF16 expert weights.
+            moe_backend = "triton"
         self.experts = FusedMoEFactory(
             num_experts=cfg.num_experts,
             top_k=cfg.num_experts_per_token,
@@ -726,6 +745,7 @@ class GrugMoeMLP(nn.Module):
             prefix=f"{prefix}.experts",
             router=moe_router,
             router_logits_dtype=torch.float32,
+            moe_backend=moe_backend,
         )
 
     def _routed_input(self, x_flat: torch.Tensor) -> torch.Tensor:
