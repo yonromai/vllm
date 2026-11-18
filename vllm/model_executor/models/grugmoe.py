@@ -625,6 +625,8 @@ class GrugMoeRouter(BaseRouter):
         if padding is not None:
             # Tensor-wide FP8 scales must not include stale graph padding.
             hidden_states.masked_fill_(padding[:, None], 0)
+            # Zero-weight padding routes still affect expert block layout.
+            router_logits = router_logits.masked_fill(padding[:, None], 0)
         _, selected = torch.topk(
             router_logits.float() + self.bias.float(),
             k=self.top_k + 1,

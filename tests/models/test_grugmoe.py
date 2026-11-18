@@ -1011,6 +1011,43 @@ def test_grug_moe_router_selects_biased_topk_and_normalized_unbiased_weights():
     )
 
 
+def test_grug_moe_router_padding_ids_ignore_stale_logits(monkeypatch):
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    router = GrugMoeRouter(
+        top_k=2,
+        global_num_experts=4,
+        bias=torch.tensor([0.4, 0.8, 0.2, -0.1]),
+    )
+    first = torch.tensor([[3.0, -1.0, 2.0, 0.0], [8.0, 7.0, -8.0, -8.0]])
+    second = torch.tensor([[3.0, -1.0, 2.0, 0.0], [-8.0, -8.0, 7.0, 8.0]])
+    originals = first.clone(), second.clone()
+    with set_forward_context(
+        None,
+        get_current_vllm_config(),
+        num_tokens=2,
+        is_padding=torch.tensor([False, True]),
+    ):
+        first_weights, first_ids = router.select_experts(
+            hidden_states=torch.ones(2, 4), router_logits=first
+        )
+        second_weights, second_ids = router.select_experts(
+            hidden_states=torch.ones(2, 4), router_logits=second
+        )
+
+    torch.testing.assert_close(first_ids[0], torch.tensor([0, 2], dtype=torch.int32))
+    assert ((first_ids[1] >= 0) & (first_ids[1] < 4)).all()
+    torch.testing.assert_close(second_ids, first_ids, rtol=0, atol=0)
+    expected = torch.sigmoid(torch.tensor([3.0, 2.0]))
+    expected *= _ROUTER_COMBINE_WEIGHT_SUM / (
+        expected.sum() + _ROUTER_COMBINE_WEIGHT_EPS
+    )
+    torch.testing.assert_close(first_weights[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(second_weights, first_weights, rtol=0, atol=0)
+    torch.testing.assert_close(first_weights[1], torch.zeros(2), rtol=0, atol=0)
+    torch.testing.assert_close(first, originals[0], rtol=0, atol=0)
+    torch.testing.assert_close(second, originals[1], rtol=0, atol=0)
+
+
 def test_grug_moe_router_keeps_zero_weight_underflow_finite():
     router = GrugMoeRouter(
         top_k=2,
