@@ -71,9 +71,8 @@ def _canonicalize_marlin_moe_token_order(
     reduction can depend on physical block position, so equivalent routed
     layouts need a common ordering before entering the kernel.
 
-    Alignment buffers may contain unspecified data after
-    num_tokens_post_padded. Keep that inactive tail strictly after the active
-    prefix so its contents cannot affect canonicalization.
+    Only the prefix before num_tokens_post_padded is active. Keep the inactive
+    tail strictly after it so canonicalization preserves the active range.
     """
     block_experts = expert_ids.to(dtype=torch.int64)
     block_positions = torch.arange(
@@ -113,8 +112,8 @@ def _canonicalize_marlin_moe_token_order(
     key_stride = num_valid_tokens + 1
 
     # Valid token IDs are in [0, num_valid_tokens), with the padding sentinel
-    # at num_valid_tokens. Values in the inactive tail are unspecified, so do
-    # not let them contribute to the sort key.
+    # at num_valid_tokens. The inactive tail is outside the kernel's active
+    # range and must not contribute to the sort key.
     token_key = torch.where(
         active_slots,
         token_ids,
