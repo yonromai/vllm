@@ -44,6 +44,7 @@ from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Static128BlockSym,
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -1357,9 +1358,11 @@ def _is_supported_online_fp8(quant_config: QuantizationConfig) -> bool:
         return False
     args = quant_config.args
     return args.targets is None and all(
-        spec is None
-        or (spec.weight == kFp8StaticTensorSym and spec.activation is None)
-        for spec in (args.linear, args.moe)
+        spec is None or (spec.weight in weights and spec.activation is None)
+        for spec, weights in (
+            (args.linear, (kFp8StaticTensorSym,)),
+            (args.moe, (kFp8StaticTensorSym, kFp8Static128BlockSym)),
+        )
     )
 
 
